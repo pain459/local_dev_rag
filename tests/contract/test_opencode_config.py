@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from local_dev_rag.domain import RequestIdentity
+
 ROOT = Path(__file__).resolve().parents[2]
 MODELS = {
     "qwen3-coder:30b",
@@ -35,7 +37,10 @@ def plugin_headers(directory, provider="local-rag", project_id="repo-identity", 
         const output = { headers: { existing: 'kept' } };
         await hooks['chat.headers']({ sessionID: process.argv[5],
             provider: { info: { id: process.argv[3] } } }, output);
-        console.log(JSON.stringify(output.headers));
+        const request = new Request('http://localhost:8080/v1/chat/completions', {
+            method: 'POST', headers: output.headers,
+        });
+        console.log(JSON.stringify(Object.fromEntries(request.headers)));
     """
     result = subprocess.run(
         [
@@ -49,10 +54,11 @@ def plugin_headers(directory, provider="local-rag", project_id="repo-identity", 
             project_id,
             session,
         ],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
+    assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
 
 
@@ -68,7 +74,7 @@ def test_plugin_adds_identity_and_preserves_existing_headers(tmp_path):
     headers = plugin_headers(tmp_path)
     assert headers["existing"] == "kept"
     assert headers["x-opencode-session-id"] == "s-1"
-    assert headers["x-opencode-project-root"] == str(tmp_path.resolve())
+    assert RequestIdentity.from_headers(headers).project_root == str(tmp_path.resolve())
     assert len(headers["x-opencode-project-id"]) == 64
     assert all(char in "0123456789abcdef" for char in headers["x-opencode-project-id"])
     assert (
@@ -79,6 +85,17 @@ def test_plugin_adds_identity_and_preserves_existing_headers(tmp_path):
 
 def test_plugin_leaves_other_providers_untouched(tmp_path):
     assert plugin_headers(tmp_path, provider="other") == {"existing": "kept"}
+
+
+@pytest.mark.parametrize("name", ["项目", "percent%2F space\nfolder"])
+def test_diagnostic_root_round_trips_through_actual_request_headers(tmp_path, name):
+    directory = tmp_path / name
+    directory.mkdir()
+    headers = plugin_headers(directory)
+    assert headers["x-opencode-project-root"].isascii()
+    identity = RequestIdentity.from_headers(headers)
+    assert identity.project_root == str(directory.resolve())
+    assert identity.project_id == headers["x-opencode-project-id"]
 
 
 def test_local_remote_paths_normalize_absolute_and_relative_addresses(tmp_path):

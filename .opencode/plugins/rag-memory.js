@@ -38,7 +38,8 @@ export const RagMemoryPlugin = async ({ project, directory, worktree }) => {
       if (input.provider.info.id !== "local-rag") return;
       output.headers["x-opencode-session-id"] = input.sessionID;
       output.headers["x-opencode-project-id"] = projectID;
-      output.headers["x-opencode-project-root"] = root;
+      // Fetch headers require HTTP-safe bytes, including for Unicode project paths.
+      output.headers["x-opencode-project-root"] = encodeURIComponent(root);
     },
   };
 };

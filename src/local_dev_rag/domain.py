@@ -3,6 +3,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Self
+from urllib.parse import unquote
 
 
 class InvalidRequestError(ValueError):
@@ -23,8 +24,9 @@ class RequestIdentity:
         for header in ("x-opencode-session-id", "x-opencode-project-id"):
             if not normalized.get(header, "").strip():
                 raise InvalidRequestError(f"Missing required header: {header}", param=header)
+        encoded_root = normalized.get("x-opencode-project-root")
         return cls(
             session_id=normalized["x-opencode-session-id"],
             project_id=normalized["x-opencode-project-id"],
-            project_root=normalized.get("x-opencode-project-root"),
+            project_root=unquote(encoded_root) if encoded_root is not None else None,
         )

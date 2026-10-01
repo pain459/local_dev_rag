@@ -37,3 +37,15 @@ def test_project_root_is_optional_diagnostic_metadata():
         }
     )
     assert identity.project_root is None
+
+
+def test_encoded_diagnostic_root_is_decoded_without_changing_project_identity():
+    identity = RequestIdentity.from_headers(
+        {
+            "x-opencode-session-id": "session",
+            "x-opencode-project-id": "authoritative",
+            "x-opencode-project-root": "%2Ftmp%2F%E9%A1%B9%E7%9B%AE%20%252F",
+        }
+    )
+    assert identity.project_root == "/tmp/项目 %2F"
+    assert identity.project_id == "authoritative"
