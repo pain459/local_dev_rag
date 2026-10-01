@@ -1,6 +1,7 @@
 import asyncio
 import json
 
+import anyio
 import httpx
 import pytest
 from starlette.requests import ClientDisconnect
@@ -260,6 +261,37 @@ async def test_failure_before_first_stream_fragment_returns_502():
     assert response.status_code == 502
     assert response.json()["error"]["type"] == "upstream_error"
     assert fragments.closed
+
+
+@pytest.mark.parametrize("stream", [True, False], ids=["stream-prefetch", "nonstream-read"])
+async def test_cancelled_body_read_finishes_checkpointed_upstream_cleanup(stream):
+    # Without shielding the route's exit stack, cancellation interrupts aclose().
+    waiting = anyio.Event()
+    cleanup = []
+
+    class Checkpointed(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            waiting.set()
+            await anyio.sleep_forever()
+            yield b"unreachable"
+
+        async def aclose(self):
+            cleanup.append("started")
+            await anyio.lowlevel.checkpoint()
+            cleanup.append("finished")
+
+    app = app_for(
+        lambda request: httpx.Response(
+            200, stream=Checkpointed(), headers={"content-type": "text/event-stream"}
+        )
+    )
+    with anyio.fail_after(1):
+        async with anyio.create_task_group() as group:
+            group.start_soon(post, app, {"model": MODEL, "messages": [], "stream": stream})
+            await waiting.wait()
+            group.cancel_scope.cancel()
+
+    assert cleanup == ["started", "finished"]
 
 
 async def invoke_stream(app, send, state=None, *, asgi_version="2.4", disconnect=None):

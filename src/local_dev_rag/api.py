@@ -209,7 +209,8 @@ def create_app(
         except httpx.HTTPError:
             return upstream_error("Unable to complete the Ollama request")
         finally:
-            await stack.aclose()
+            with CancelScope(shield=True):
+                await stack.aclose()
 
     @app.get("/healthz", response_model=HealthResponse)
     async def health() -> HealthResponse:
