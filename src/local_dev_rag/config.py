@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     default_model: str = "qwen3-coder:30b"
     curator_model: str = "qwen2.5-coder:1.5b"
     embedding_model: str = "nomic-embed-text:latest"
+    embedding_version: int = Field(default=1, gt=0)
     model_budgets: dict[str, ModelBudget] = Field(default_factory=_default_budgets)
     memory_token_budget: int = Field(default=1024, gt=0)
     retrieval_candidate_limit: int = Field(default=20, gt=0)

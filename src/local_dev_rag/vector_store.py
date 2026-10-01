@@ -4,6 +4,7 @@ from collections.abc import AsyncGenerator, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime
+from hashlib import sha256
 from uuid import UUID
 
 import httpx
@@ -53,11 +54,16 @@ class VectorStore:
         self,
         settings: Settings,
         *,
-        collection_name: str = "local_dev_rag_memory",
+        collection_name: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         self._url = settings.chromadb_url.rstrip("/")
-        self._collection_name = collection_name
+        model_key = sha256(settings.embedding_model.encode("utf-8")).hexdigest()[:12]
+        self._collection_name = (
+            collection_name
+            if collection_name is not None
+            else f"local_dev_rag_memory_v{settings.embedding_version}_{model_key}"
+        )
         self._transport = transport
 
     @asynccontextmanager

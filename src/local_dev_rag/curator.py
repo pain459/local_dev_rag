@@ -264,7 +264,8 @@ def _option_evidence(
                     if connector not in {"and", ","}:
                         inherited = None
                         decision_frame = False
-                        conditional = False
+                        if connector != "while":
+                            conditional = False
                     continue
                 status, subjects = _clause_evidence(clause, inherited, previous, decision_frame)
                 conditional = conditional or bool(_CONDITION.search(clause))
@@ -483,9 +484,19 @@ class Curator:
             # bounded selection paraphrase needs every subject affirmed; other
             # durable facts need every content/action term in certain evidence.
             candidate_facts = _fact_terms(text)
+            negation = {"not", "no", "never"}
             supported = (
-                bool(decision_subjects) and decision_subjects <= selected_terms
-            ) or (bool(candidate_facts) and any(candidate_facts <= fact for fact in fact_terms))
+                bool(decision_subjects)
+                and decision_subjects <= selected_terms
+                and not candidate_facts & negation
+            ) or (
+                bool(candidate_facts)
+                and any(
+                    candidate_facts <= fact
+                    and candidate_facts & negation == fact & negation
+                    for fact in fact_terms
+                )
+            )
             key = (candidate.kind, " ".join(text.casefold().split()))
             if (
                 not text

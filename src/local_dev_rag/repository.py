@@ -17,13 +17,15 @@ from local_dev_rag.domain import (
     AssistantCompletion,
     ConversationEventInput,
     CuratorSource,
+    MemoryDraft,
+    MemoryItem,
     MemoryJob,
     RequestIdentity,
     Scope,
     StoredEvent,
 )
 from local_dev_rag.events import content_hash
-from local_dev_rag.schema import conversation_events, memory_jobs, projects, sessions
+from local_dev_rag.schema import conversation_events, memory_items, memory_jobs, projects, sessions
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,117 @@ def _stored_event(row: RowMapping) -> StoredEvent:
 
 def _memory_job(row: RowMapping) -> MemoryJob:
     return MemoryJob(**dict(row))
+
+
+class MemoryRepository:
+    """Accepted extraction snapshots; source-event locking serializes competing retries."""
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def for_source(self, source: CuratorSource) -> list[MemoryItem]:
+        rows = (
+            (
+                await self.session.execute(
+                    select(memory_items)
+                    .where(
+                        memory_items.c.project_id == source.project_id,
+                        memory_items.c.source_session_id == source.session_id,
+                        memory_items.c.source_event_id == source.source_event_id,
+                    )
+                    .order_by(memory_items.c.created_at, memory_items.c.id)
+                )
+            )
+            .mappings()
+            .all()
+        )
+        return [MemoryItem(**dict(row)) for row in rows]
+
+    async def persist(
+        self, source: CuratorSource, drafts: Sequence[MemoryDraft], *, curator_model: str
+    ) -> list[MemoryItem]:
+        event = await self.session.scalar(
+            select(conversation_events.c.id)
+            .where(
+                conversation_events.c.id == source.source_event_id,
+                conversation_events.c.project_id == source.project_id,
+                conversation_events.c.session_id == source.session_id,
+                conversation_events.c.role == "assistant",
+                conversation_events.c.completed.is_(True),
+            )
+            .with_for_update()
+        )
+        if event is None:
+            raise ValueError("Memory source provenance mismatch")
+        existing = await self.for_source(source)
+        if existing:
+            return existing
+        for draft in drafts:
+            await self.session.execute(
+                insert(memory_items)
+                .values(
+                    id=uuid4(),
+                    project_id=source.project_id,
+                    source_session_id=source.session_id,
+                    source_event_id=source.source_event_id,
+                    kind=draft.kind,
+                    text=draft.text,
+                    confidence=draft.confidence,
+                    importance=draft.importance,
+                    curator_model=curator_model,
+                )
+                .on_conflict_do_nothing(constraint="uq_memory_source_content")
+            )
+        return await self.for_source(source)
+
+    async def project_id(self, external_id: str) -> UUID:
+        if not external_id.strip():
+            raise ValueError("An explicit project external ID is required")
+        project_id = await self.session.scalar(
+            select(projects.c.id).where(projects.c.external_project_id == external_id)
+        )
+        if project_id is None:
+            raise ValueError("Unknown project external ID")
+        return cast(UUID, project_id)
+
+    async def active(self, project_id: UUID) -> list[MemoryItem]:
+        rows = (
+            (
+                await self.session.execute(
+                    select(memory_items)
+                    .where(
+                        memory_items.c.project_id == project_id,
+                        memory_items.c.state == "active",
+                    )
+                    .order_by(memory_items.c.created_at, memory_items.c.id)
+                )
+            )
+            .mappings()
+            .all()
+        )
+        return [MemoryItem(**dict(row)) for row in rows]
+
+    async def record_embedding(
+        self, project_id: UUID, ids: Sequence[UUID], model: str, version: int
+    ) -> list[MemoryItem]:
+        # UPDATE locks only still-active records until the vector upsert finishes.
+        rows = (
+            (
+                await self.session.execute(
+                    update(memory_items)
+                    .where(
+                        memory_items.c.project_id == project_id,
+                        memory_items.c.id.in_(ids),
+                        memory_items.c.state == "active",
+                    )
+                    .values(embedding_model=model, embedding_version=version, updated_at=func.now())
+                    .returning(memory_items)
+                )
+            )
+            .mappings()
+            .all()
+        )
+        return [MemoryItem(**dict(row)) for row in rows]
 
 
 class ConversationRepository:

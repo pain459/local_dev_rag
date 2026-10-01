@@ -817,3 +817,56 @@ async def test_supported_facts_cannot_be_combined_into_an_unsupported_usage_clai
     )
     evidence = "We decided to use PostgreSQL. Redis restarted successfully."
     assert await instance.extract(source(evidence)) == []
+
+
+@pytest.mark.parametrize("kind", KINDS)
+async def test_fronted_condition_survives_nested_while(kind):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(kind=kind, text="Use Redis."),
+                        candidate(text="Use PostgreSQL."),
+                    ]
+                }
+            )
+        )
+    )
+    evidence = (
+        "We selected PostgreSQL. If the benchmark succeeds while latency stays low, "
+        "we will use Redis."
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    ("evidence", "text"),
+    [
+        ("Redis is not used for caching.", "Redis is used for caching."),
+        ("Redis is used for caching.", "Redis is not used for caching."),
+    ],
+)
+async def test_factual_support_cannot_reverse_explicit_polarity(kind, evidence, text):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {"memories": [candidate(kind=kind, text=text), candidate(text="Use PostgreSQL.")]}
+            )
+        )
+    )
+    assert await instance.extract(source("We selected PostgreSQL. " + evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("text", ["Redis is used for caching.", "Redis is not used for caching."])
+async def test_factual_support_retains_matching_positive_and_negative_polarity(kind, text):
+    instance = curator(
+        lambda request: response(json.dumps({"memories": [candidate(kind=kind, text=text)]}))
+    )
+    assert await instance.extract(source(text)) == [MemoryDraft(kind, text, 0.9, 0.8)]
