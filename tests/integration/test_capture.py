@@ -90,22 +90,52 @@ async def test_identical_retries_create_one_completion_and_job(database, stream)
         nonlocal attempts
         attempts += 1
         upstream_id = f"upstream-{attempts}"
+        answer = f"answer {attempts}"
+        result = {
+            **RESULT,
+            "id": upstream_id,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": answer},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
         return httpx.Response(
             200,
             content=(
-                SSE.replace(b"upstream-1", upstream_id.encode())
+                SSE.replace(b"upstream-1", upstream_id.encode()).replace(
+                    b'"answer"', json.dumps(answer).encode()
+                )
                 if stream
-                else json.dumps({**RESULT, "id": upstream_id}).encode()
+                else json.dumps(result).encode()
             ),
             headers={"content-type": "text/event-stream" if stream else "application/json"},
         )
 
     app = capture_app(database, handler)
     await post(app, stream=stream)
-    await post(app, stream=stream)
+    response = await post(app, stream=stream)
+    if stream:
+        assert b'"content":"answer 2"' in response.content
+    else:
+        assert response.json()["choices"][0]["message"]["content"] == "answer 2"
     events, jobs = await rows(database)
     assert [event["role"] for event in events] == ["user", "assistant"]
+    assert events[1]["payload"]["content"] == "answer 1"
     assert len(jobs) == 1
+    question = {"role": "user", "content": "question"}
+    first_answer = {"role": "assistant", "content": "answer 1"}
+    await post(app, [question, first_answer, question], stream=stream)
+    events, jobs = await rows(database)
+    assert [event["payload"] for event in events] == [
+        question,
+        first_answer,
+        question,
+        {"role": "assistant", "content": "answer 3"},
+    ]
+    assert len(jobs) == 2
 
 
 async def test_growing_history_deduplicates_completion_echo_and_retains_repeated_turn(database):

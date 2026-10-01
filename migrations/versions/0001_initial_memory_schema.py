@@ -70,6 +70,7 @@ def upgrade() -> None:
         sa.Column("sequence", sa.BigInteger(), nullable=False),
         sa.Column("source_message_id", sa.Text(), nullable=True),
         sa.Column("request_id", sa.Text(), nullable=False),
+        sa.Column("completion_request_id", sa.Text(), nullable=True),
         sa.Column("content_hash", sa.Text(), nullable=False),
         sa.Column("event_type", sa.Text(), nullable=False),
         sa.Column("role", sa.Text(), nullable=False),
@@ -95,6 +96,9 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("project_id", "session_id", "id", name="uq_event_scope_id"),
         sa.UniqueConstraint("session_id", "content_hash", name="uq_event_content"),
+        sa.UniqueConstraint(
+            "session_id", "completion_request_id", name="uq_event_completion_request"
+        ),
         sa.UniqueConstraint("session_id", "sequence", name="uq_event_sequence"),
     )
     op.create_index(

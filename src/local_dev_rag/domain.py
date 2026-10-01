@@ -74,6 +74,7 @@ class ConversationEventInput:
     completed: bool = True
     # Normalizers retain the preceding occurrence identity so hashes can be recomputed.
     parent_hash: str = ""
+    completion_request_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", _freeze_payload(self.payload))
@@ -94,6 +95,7 @@ class StoredEvent:
     source_message_id: str | None = None
     model: str | None = None
     completed: bool = True
+    completion_request_id: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", _freeze_payload(self.payload))

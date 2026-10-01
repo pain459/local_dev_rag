@@ -192,6 +192,55 @@ async def test_concurrent_finalization_has_one_event_and_one_job(database: Datab
         assert await session.scalar(text("SELECT count(*) FROM memory_jobs")) == 1
 
 
+async def test_concurrent_different_answers_share_one_request_completion(database: Database):
+    async with database.session() as session:
+        scope = await ConversationRepository(session).ensure_scope(RequestIdentity("s", "p"))
+    gate = asyncio.Event()
+
+    async def finalize(index):
+        async with database.session() as session:
+            await gate.wait()
+            return await ConversationRepository(session).finalize_assistant(
+                scope,
+                AssistantCompletion(
+                    payload={"content": f"answer {index}"},
+                    content_hash=f"answer-{index}",
+                    request_id="request-one",
+                ),
+            )
+
+    tasks = [asyncio.create_task(finalize(index)) for index in range(8)]
+    gate.set()
+    records = await asyncio.wait_for(asyncio.gather(*tasks), 15)
+    assert len({record.id for record in records}) == 1
+    assert len({record.content_hash for record in records}) == 1
+    async with database.session() as session:
+        assert await session.scalar(text("SELECT count(*) FROM conversation_events")) == 1
+        assert await session.scalar(text("SELECT count(*) FROM memory_jobs")) == 1
+
+
+async def test_existing_inbound_echo_can_be_claimed_as_one_request_completion(database: Database):
+    async with database.session() as session:
+        repository = ConversationRepository(session)
+        scope = await repository.ensure_scope(RequestIdentity("s", "p"))
+        inbound = (await repository.append_events(scope, [event("answer-a", role="assistant")]))[0]
+        first = await repository.finalize_assistant(
+            scope,
+            AssistantCompletion(
+                payload={"content": "answer-a"}, content_hash="answer-a", request_id="request-one"
+            ),
+        )
+        retry = await repository.finalize_assistant(
+            scope,
+            AssistantCompletion(
+                payload={"content": "answer-b"}, content_hash="answer-b", request_id="request-one"
+            ),
+        )
+        assert first.id == retry.id == inbound.id
+        assert await session.scalar(text("SELECT count(*) FROM conversation_events")) == 1
+        assert await session.scalar(text("SELECT count(*) FROM memory_jobs")) == 1
+
+
 async def test_session_context_rolls_back_failed_operation(database: Database):
     with pytest.raises(RuntimeError):
         async with database.session() as session:

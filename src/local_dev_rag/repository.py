@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -120,27 +120,58 @@ class ConversationRepository:
                     payload=_json_value(event.payload),
                     content_hash=event.content_hash,
                     request_id=event.request_id,
+                    completion_request_id=event.completion_request_id,
                     source_message_id=event.source_message_id,
                     model=event.model,
                     completed=event.completed,
                 )
-                .on_conflict_do_nothing(constraint="uq_event_content")
+                .on_conflict_do_nothing()
                 .returning(conversation_events)
             )
             row = (await self.session.execute(statement)).mappings().one_or_none()
             if row is None:
-                row = (
-                    (
-                        await self.session.execute(
-                            select(conversation_events).where(
-                                conversation_events.c.session_id == scope.session_id,
-                                conversation_events.c.content_hash == event.content_hash,
+                if event.completion_request_id is not None:
+                    row = (
+                        (
+                            await self.session.execute(
+                                select(conversation_events).where(
+                                    conversation_events.c.session_id == scope.session_id,
+                                    conversation_events.c.completion_request_id
+                                    == event.completion_request_id,
+                                )
                             )
                         )
+                        .mappings()
+                        .one_or_none()
                     )
-                    .mappings()
-                    .one()
-                )
+                if row is None:
+                    row = (
+                        (
+                            await self.session.execute(
+                                select(conversation_events).where(
+                                    conversation_events.c.session_id == scope.session_id,
+                                    conversation_events.c.content_hash == event.content_hash,
+                                )
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
+                # An echo captured during recovery may precede its generation finalization.
+                # Claim its request identity under the same session lock, retaining its content.
+                if event.completion_request_id is not None and row["completion_request_id"] is None:
+                    row = (
+                        (
+                            await self.session.execute(
+                                update(conversation_events)
+                                .where(conversation_events.c.id == row["id"])
+                                .values(completion_request_id=event.completion_request_id)
+                                .returning(conversation_events)
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
             else:
                 sequence += 1
             stored.append(_stored_event(row))
@@ -167,6 +198,9 @@ class ConversationRepository:
                         source_message_id=completion.source_message_id,
                         model=completion.model,
                         completed=completion.completed,
+                        completion_request_id=completion.request_id
+                        if completion.completed
+                        else None,
                     )
                 ],
             )
