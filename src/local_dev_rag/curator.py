@@ -35,6 +35,18 @@ _UNRESOLVED = re.compile(
     r"\b(either|or|neither|whether|if|unless|never|haven['’]t|hasn['’]t|didn['’]t|did\s+not)\b",
     re.I,
 )
+# Scope markers are kept separately from clause predicates: splitting a comma or
+# entering an infinitive must never strip uncertainty from the governing clause.
+_CONDITION = re.compile(
+    r"\b(?:if|unless|when|once|provided(?:\s+that)?|providing(?:\s+that)?"
+    r"|assuming|as\s+long\s+as|in\s+case|on\s+condition\s+that)\b",
+    re.I,
+)
+_UNCERTAIN = re.compile(
+    r"\b(?:may|would|should|probably|perhaps|possibly|potentially|likely|tentative"
+    r"|either|or|neither|whether)\b",
+    re.I,
+)
 _CLAUSES = re.compile(r"(\b(?:and|but|while|whereas|however|instead\s+of|rather\s+than)\b|,)", re.I)
 _CONTEXT = re.compile(r"\b(?:for|because|since|when|with|as|which|that)\b", re.I)
 _FRAME = re.compile(r"\b(decided|selected|chose|agreed)\b", re.I)
@@ -49,12 +61,6 @@ _PASSIVE_PREFIX = re.compile(
     r"\s*([\w.-]+)\s+(?:is|was|were|are|has been|have been)\s+(?:only\s+)?", re.I
 )
 _NOMINAL = re.compile(r"[\w.-]+")
-_DECISION_LIKE = re.compile(
-    r"\b(?:decid(?:e[ds]?|ing)|decision|select(?:ed)?|cho(?:ose|se|sen)|confirm(?:ed)?"
-    r"|agree(?:d)?|will|must|shall|uses?|adopt(?:ed)?|prefer(?:red)?|require[sd]?"
-    r"|replac(?:e[sd]?|ing))\b",
-    re.I,
-)
 # A bounded paraphrase vocabulary, never a list of known technologies. Every other
 # content term is an option/subject and must be affirmatively supported, wherever
 # it occurs in a draft. Unknown wording fails closed instead of trusting overlap.
@@ -136,13 +142,19 @@ def _terms(text: str) -> set[str]:
 
 def _nominal_terms(text: str) -> set[str]:
     """Only identifier lists are eligible, never unknown verbs or alternatives."""
-    subject = _CONTEXT.split(text, maxsplit=1)[0].strip(" \t\"'{}:")
+    subject = _CONDITION.split(text, maxsplit=1)[0]
+    subject = _CONTEXT.split(subject, maxsplit=1)[0].strip(" \t\"'{}:,")
     options = re.split(r"\s*(?:,\s*(?:and\s+)?|\band\b)\s*", subject)
     return _terms(subject) if all(_NOMINAL.fullmatch(option) for option in options) else set()
 
 
 def _evidence_clauses(statement: str) -> list[str]:
     """Keep a nominal list and its qualifiers under one governing predicate."""
+    # An incidental comma after a conjunction does not attach its following
+    # condition to the preceding assertion ("PostgreSQL and, if ..., Redis").
+    statement = re.sub(
+        r"\b(and|but|while|whereas|however)\s*,\s*", r"\1 ", statement, flags=re.I
+    )
     parts = _CLAUSES.split(statement)
     clauses: list[str] = []
     current = parts[0]
@@ -150,10 +162,15 @@ def _evidence_clauses(statement: str) -> list[str]:
         connector, following = parts[index : index + 2]
         # Only a new predicate or explicit negation/infinitive opens a clause.
         # Thus "Redis, PostgreSQL, or MongoDB" is checked as one uncertain list.
-        independent = _PREDICATE.search(following) or re.match(
-            r"^\s*(?:not|neither|(?:to\s+)?use)\b", following, re.I
+        independent = (
+            _PREDICATE.search(following)
+            or _CONDITION.match(following.strip())
+            or re.match(r"^\s*(?:not|neither|(?:to\s+)?use)\b", following, re.I)
         )
-        if connector.casefold() in {"and", ","} and not independent:
+        # A trailing comma condition qualifies the current predicate; a condition
+        # after "and" instead opens the scope of the next coordinated action.
+        trailing_condition = connector == "," and _CONDITION.match(following.strip())
+        if connector.casefold() in {"and", ","} and (not independent or trailing_condition):
             current += " " + connector + " " + following
         else:
             clauses.extend((current, connector))
@@ -198,16 +215,15 @@ def _clause_evidence(
             subjects = previous
         if status == "selected" and (
             (not passive and not _ACTIVE_PREFIX.fullmatch(prefix))
-            or _SPECULATIVE.search(clause)
-            or _UNRESOLVED.search(clause)
             or re.search(r"\bnot\b", prefix, re.I)
         ):
             status = "unselected"
         return status, subjects
     # Coordinated infinitives belong to a decision frame but have their own negation.
     infinitive = re.match(r"^(not\s+)?(?:to\s+)?use\s+(.+)", clause, re.I)
-    if infinitive and decision_frame:
-        return ("rejected" if infinitive[1] else "selected"), _nominal_terms(infinitive[2])
+    if infinitive:
+        status = ("rejected" if infinitive[1] else "selected") if decision_frame else "unselected"
+        return status, _nominal_terms(infinitive[2])
     negative = re.match(r"^(?:not|neither)\s+(.+)", clause, re.I)
     if negative:
         return "rejected", _nominal_terms(negative[1])
@@ -218,16 +234,25 @@ def _clause_evidence(
     return inherited, _nominal_terms(clause) if inherited else set()
 
 
+def _fact_terms(text: str) -> set[str]:
+    """Literal fact coverage keeps action/negation terms that option parsing omits."""
+    return set(re.findall(r"[\w-]+", text.casefold())) - {
+        "i", "we", "they", "it", "the", "a", "an", "is", "was", "are", "were",
+        "be", "been", "being", "has", "have", "had", "to", "of", "for", "in", "on",
+        "and", "as", "that", "which",
+    }
+
+
 def _option_evidence(
     records: list[dict[str, object]],
-) -> tuple[set[str], set[str], set[str]]:
+) -> tuple[set[str], set[str], list[set[str]]]:
     states: dict[str, Polarity] = {}
-    grounded: set[str] = set()
+    facts: list[set[str]] = []
     for record in records:
         excerpt = _excerpt_text(cast(str, record["excerpt"]))
-        grounded.update(_terms(excerpt))
         for statement in re.split(r"[.!?;\n]", excerpt):
             decision_frame = False
+            conditional = False
             inherited: Polarity | None = None
             previous: set[str] = set()
             for clause in _evidence_clauses(statement):
@@ -239,8 +264,20 @@ def _option_evidence(
                     if connector not in {"and", ","}:
                         inherited = None
                         decision_frame = False
+                        conditional = False
                     continue
                 status, subjects = _clause_evidence(clause, inherited, previous, decision_frame)
+                conditional = conditional or bool(_CONDITION.search(clause))
+                uncertain = bool(
+                    conditional or _SPECULATIVE.search(clause) or _UNCERTAIN.search(clause)
+                )
+                # This is the single affirmation boundary for *all* parse paths,
+                # including predicates, coordinated infinitives and bare lists.
+                if status == "selected" and (uncertain or _UNRESOLVED.search(clause)):
+                    status = "unselected"
+                if not uncertain and status not in {"unselected", "rejected"}:
+                    # Do not assemble a new assertion from unrelated clauses.
+                    facts.append(_fact_terms(clause))
                 if status:
                     for subject in subjects:
                         # Availability after an explicit selection does not revoke it.
@@ -257,7 +294,7 @@ def _option_evidence(
     return (
         {term for term, state in states.items() if state == "selected"},
         {term for term, state in states.items() if state != "selected"},
-        grounded,
+        facts,
     )
 
 
@@ -431,7 +468,7 @@ class Curator:
         if len(candidates) > self.max_memories:
             raise CuratorValidationError("Curator candidates exceed count budget")
         source_text = cast(str, cast(list[dict[str, object]], payload["messages"])[1]["content"])
-        selected_terms, excluded_terms, grounded_terms = _option_evidence(json.loads(source_text))
+        selected_terms, excluded_terms, fact_terms = _option_evidence(json.loads(source_text))
         drafts: list[MemoryDraft] = []
         seen: set[tuple[MemoryKind, str]] = set()
         for item in candidates:
@@ -441,8 +478,14 @@ class Curator:
                 continue
             text = candidate.text.strip()
             terms = _terms(text)
-            decision_like = candidate.kind == "decision" or _DECISION_LIKE.search(text)
             decision_subjects = terms - _DECISION_LANGUAGE
+            # Model labels and a guessed verb category never relax coverage. A
+            # bounded selection paraphrase needs every subject affirmed; other
+            # durable facts need every content/action term in certain evidence.
+            candidate_facts = _fact_terms(text)
+            supported = (
+                bool(decision_subjects) and decision_subjects <= selected_terms
+            ) or (bool(candidate_facts) and any(candidate_facts <= fact for fact in fact_terms))
             key = (candidate.kind, " ".join(text.casefold().split()))
             if (
                 not text
@@ -452,11 +495,7 @@ class Curator:
                 or _SPECULATIVE.search(text)
                 or _FILLER.fullmatch(text)
                 or bool(terms & excluded_terms)
-                or not bool(terms & grounded_terms)
-                or (
-                    decision_like
-                    and (not decision_subjects or not decision_subjects <= selected_terms)
-                )
+                or not supported
                 or key in seen
             ):
                 continue

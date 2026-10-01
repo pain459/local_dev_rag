@@ -650,3 +650,170 @@ async def test_an_independent_confirmed_clause_or_selected_list_remains_usable(e
     assert await instance.extract(source(evidence)) == [
         MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
     ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    "conditional",
+    [
+        "We decided to use PostgreSQL and use Redis for caching if the benchmark succeeds.",
+        "We decided to use PostgreSQL and to use Redis if the benchmark succeeds.",
+        "We selected PostgreSQL and use Redis, if the benchmark succeeds.",
+        "We selected PostgreSQL and, if the benchmark succeeds, use Redis for caching.",
+        "We selected PostgreSQL and if the benchmark succeeds, we will use Redis.",
+        "If the benchmark succeeds, we will use Redis for durable memory.",
+        "If the benchmark succeeds, we decided to use MongoDB and use Redis.",
+        "Unless the benchmark fails, Redis was selected for durable memory.",
+        "Provided that the benchmark succeeds, we will use Redis.",
+        "Assuming the benchmark succeeds, we decided to use Redis.",
+        "Once the benchmark succeeds, we will use Redis.",
+        "We will use Redis provided that the benchmark succeeds.",
+        "We decided to use PostgreSQL and use Redis unless the benchmark fails.",
+        "We selected PostgreSQL and use Redis when the benchmark succeeds.",
+        "We selected PostgreSQL and use Redis as long as the benchmark succeeds.",
+        "Redis was selected, if the benchmark succeeds.",
+    ],
+)
+async def test_conditional_scope_never_affirms_an_option_for_any_memory_kind(kind, conditional):
+    instance = curator(
+        lambda request: response(
+            json.dumps({"memories": [candidate(kind=kind, text="Use Redis."), candidate()]})
+        )
+    )
+    # An independent certainty must survive whichever clause path carries uncertainty.
+    evidence = "We decided to use PostgreSQL for durable memory. " + conditional
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Redis is used alongside PostgreSQL for durable memory.",
+        "PostgreSQL is the database and Redis is the cache.",
+        "PostgreSQL runs with Valkey.",
+        "The PostgreSQL service depends on nats.",
+        "PostgreSQL recovered after restarting MongoDB.",
+    ],
+)
+async def test_every_kind_requires_grounding_for_every_content_subject(kind, text):
+    instance = curator(
+        lambda request: response(
+            json.dumps({"memories": [candidate(kind=kind, text=text), candidate()]})
+        )
+    )
+    assert await instance.extract(source()) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("kind", "evidence", "text"),
+    [
+        (
+            "requirement",
+            "The project requires PostgreSQL to support transactional writes.",
+            "PostgreSQL requires support for transactional writes.",
+        ),
+        ("constraint", "Redis has a 256 MB limit.", "Redis has a 256 MB limit."),
+        ("preference", "The team prefers Ruff for linting.", "The team prefers Ruff for linting."),
+        (
+            "error",
+            "PostgreSQL could not connect because port 5432 was busy.",
+            "PostgreSQL could not connect because port 5432 was busy.",
+        ),
+        (
+            "fix",
+            "Restarting PostgreSQL fixed the connection failure.",
+            "Restarting PostgreSQL fixed the connection failure.",
+        ),
+        (
+            "outcome",
+            "The PostgreSQL migration completed successfully.",
+            "The PostgreSQL migration completed successfully.",
+        ),
+        (
+            "decision",
+            "We decided to use PostgreSQL for durable memory.",
+            "PostgreSQL is the selected durable memory store.",
+        ),
+    ],
+)
+async def test_grounded_durable_facts_do_not_require_an_option_selection(kind, evidence, text):
+    instance = curator(
+        lambda request: response(json.dumps({"memories": [candidate(kind=kind, text=text)]}))
+    )
+    assert await instance.extract(source(evidence)) == [MemoryDraft(kind, text, 0.9, 0.8)]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "PostgreSQL failed during startup.",
+        "If the benchmark succeeds, Redis will recover PostgreSQL.",
+        "Redis may recover PostgreSQL.",
+    ],
+)
+async def test_factual_grounding_does_not_turn_mentions_or_conditions_into_usage(kind, evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps({"memories": [candidate(kind=kind, text="Use Redis with PostgreSQL.")]})
+        )
+    )
+    assert await instance.extract(source(evidence)) == []
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "We decided to use PostgreSQL and use Redis for caching if the benchmark succeeds.",
+        "We selected PostgreSQL and, if the benchmark succeeds, use Redis for caching.",
+        "We selected PostgreSQL, and if the benchmark succeeds, we will use Redis.",
+        "We selected PostgreSQL and use Redis when the benchmark succeeds.",
+        "If the benchmark succeeds, we will use Redis, but we selected PostgreSQL.",
+        "We selected PostgreSQL and use Redis provided that the benchmark succeeds.",
+    ],
+)
+async def test_a_certain_sibling_survives_without_an_earlier_confirmation(evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps({"memories": [candidate(text="Use Redis."), candidate()]})
+        )
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "If the benchmark succeeds, we will use PostgreSQL and Redis.",
+        "We selected PostgreSQL and Redis if the benchmark succeeds.",
+        "Provided that the benchmark succeeds, PostgreSQL and Redis are used.",
+    ],
+)
+async def test_a_condition_on_a_shared_predicate_governs_every_option(kind, evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {"memories": [candidate(kind=kind, text="Use Redis."), candidate(kind=kind)]}
+            )
+        )
+    )
+    assert await instance.extract(source(evidence)) == []
+
+
+@pytest.mark.parametrize("kind", KINDS)
+async def test_supported_facts_cannot_be_combined_into_an_unsupported_usage_claim(kind):
+    instance = curator(
+        lambda request: response(
+            json.dumps({"memories": [candidate(kind=kind, text="Use Redis.")]})
+        )
+    )
+    evidence = "We decided to use PostgreSQL. Redis restarted successfully."
+    assert await instance.extract(source(evidence)) == []
