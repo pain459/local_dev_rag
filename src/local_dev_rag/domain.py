@@ -1,6 +1,6 @@
 """Request identity: stable IDs are authoritative; roots are diagnostic metadata."""
 
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
@@ -108,6 +108,20 @@ class AssistantCompletion:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", _freeze_payload(self.payload))
+
+
+@dataclass(frozen=True)
+class UpstreamResponse:
+    status_code: int
+    headers: Mapping[str, str]
+    body: AsyncIterator[bytes]
+
+
+@dataclass(frozen=True)
+class DependencyStatus:
+    name: str
+    state: Literal["healthy", "degraded", "unavailable"]
+    detail: str | None = None
 
 
 @dataclass(frozen=True)
