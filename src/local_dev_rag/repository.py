@@ -16,6 +16,7 @@ from local_dev_rag.db import Database
 from local_dev_rag.domain import (
     AssistantCompletion,
     ConversationEventInput,
+    CuratorSource,
     MemoryJob,
     RequestIdentity,
     Scope,
@@ -258,6 +259,50 @@ class ConversationRepository:
                 .one()
             )
         return _memory_job(row)
+
+    async def curator_source(self, source_event_id: UUID, *, max_events: int = 32) -> CuratorSource:
+        """Read bounded same-session history ending at the completed source event."""
+        if isinstance(max_events, bool) or not 1 <= max_events <= 256:
+            raise ValueError("Invalid curator source event limit")
+        source = (
+            (
+                await self.session.execute(
+                    select(conversation_events).where(
+                        conversation_events.c.id == source_event_id,
+                        conversation_events.c.role == "assistant",
+                        conversation_events.c.completed.is_(True),
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if source is None:
+            raise ValueError("Curator source requires a completed assistant event")
+        rows = (
+            (
+                await self.session.execute(
+                    select(conversation_events)
+                    .where(
+                        conversation_events.c.project_id == source["project_id"],
+                        conversation_events.c.session_id == source["session_id"],
+                        conversation_events.c.sequence <= source["sequence"],
+                        conversation_events.c.completed.is_(True),
+                        conversation_events.c.role.in_(["user", "assistant", "tool", "function"]),
+                    )
+                    .order_by(conversation_events.c.sequence.desc())
+                    .limit(max_events)
+                )
+            )
+            .mappings()
+            .all()
+        )
+        return CuratorSource(
+            source["project_id"],
+            source["session_id"],
+            source_event_id,
+            tuple(_stored_event(row) for row in reversed(rows)),
+        )
 
 
 @dataclass
