@@ -152,7 +152,12 @@ class UpstreamStreamingResponse(StreamingResponse):
 
         async def observe_send(message: Message) -> None:
             nonlocal delivered
-            await send(message)
+            try:
+                await send(message)
+            except OSError:
+                # Normalize client transport failures here for every ASGI version,
+                # without treating upstream read or cleanup errors as disconnects.
+                raise ClientDisconnect() from None
             if message["type"] == "http.response.body" and not message.get("more_body", False):
                 delivered = True
 

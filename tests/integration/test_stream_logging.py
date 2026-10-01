@@ -23,17 +23,22 @@ PRIVATE = "private-stream-prompt-tool-authorization-memory"
 
 
 @pytest.mark.parametrize(
-    "case,category,outcome,capture_status",
+    "case,category,outcome,capture_status,asgi_version",
     [
-        ("success", None, "completed", "completed"),
-        ("sse_error", "upstream_error", "upstream_error", "incomplete"),
-        ("premature_eof", "upstream_error", "upstream_error", "incomplete"),
-        ("read_error", "upstream_error", "upstream_error", "incomplete"),
-        ("disconnect", "cancelled", "cancelled", "incomplete"),
-        ("send_error", "cancelled", "cancelled", "incomplete"),
-        ("cancel", "cancelled", "cancelled", "incomplete"),
-        ("capture_unavailable", None, "completed", "unavailable"),
-        ("finalize_unavailable", "processing_error", "completed", "unavailable"),
+        ("success", None, "completed", "completed", "2.4"),
+        ("sse_error", "upstream_error", "upstream_error", "incomplete", "2.4"),
+        ("premature_eof", "upstream_error", "upstream_error", "incomplete", "2.4"),
+        ("read_error", "upstream_error", "upstream_error", "incomplete", "2.4"),
+        ("disconnect", "cancelled", "cancelled", "incomplete", "2.3"),
+        ("send_error", "cancelled", "cancelled", "incomplete", "2.4"),
+        ("cancel", "cancelled", "cancelled", "incomplete", "2.4"),
+        ("capture_unavailable", None, "completed", "unavailable", "2.4"),
+        ("finalize_unavailable", "processing_error", "completed", "unavailable", "2.4"),
+        ("send_error", "cancelled", "cancelled", "incomplete", "2.3"),
+        ("send_broken_pipe", "cancelled", "cancelled", "incomplete", "2.3"),
+        ("send_broken_pipe", "cancelled", "cancelled", "incomplete", "2.4"),
+        ("read_error", "upstream_error", "upstream_error", "incomplete", "2.3"),
+        ("sse_error", "upstream_error", "upstream_error", "incomplete", "2.3"),
     ],
 )
 async def test_real_stream_logs_outcome_without_changing_status_capture_or_cleanup(
@@ -43,6 +48,7 @@ async def test_real_stream_logs_outcome_without_changing_status_capture_or_clean
     category,
     outcome,
     capture_status,
+    asgi_version,
 ):
     disconnect, delivered = asyncio.Event(), asyncio.Event()
 
@@ -101,6 +107,8 @@ async def test_real_stream_logs_outcome_without_changing_status_capture_or_clean
         if message["type"] == "http.response.body" and message.get("body"):
             if case == "send_error":
                 raise OSError(PRIVATE)
+            if case == "send_broken_pipe":
+                raise BrokenPipeError(PRIVATE)
             bodies.append(message["body"])
             delivered.set()
             disconnect.set()
@@ -108,21 +116,22 @@ async def test_real_stream_logs_outcome_without_changing_status_capture_or_clean
     try:
         if case == "disconnect":
             await asyncio.wait_for(
-                invoke_stream(app, send, asgi_version="2.3", disconnect=disconnect), 2
+                invoke_stream(app, send, asgi_version=asgi_version, disconnect=disconnect), 2
             )
         elif case == "cancel":
-            task = asyncio.create_task(invoke_stream(app, send))
+            task = asyncio.create_task(invoke_stream(app, send, asgi_version=asgi_version))
             try:
                 await asyncio.wait_for(delivered.wait(), 2)
             finally:
                 task.cancel(PRIVATE)
                 with pytest.raises(asyncio.CancelledError):
                     await task
-        elif case in {"send_error", "read_error"}:
-            with pytest.raises(ClientDisconnect if case == "send_error" else httpx.ReadError):
-                await invoke_stream(app, send)
+        elif case in {"send_error", "send_broken_pipe", "read_error"}:
+            expected = httpx.ReadError if case == "read_error" else ClientDisconnect
+            with pytest.raises(expected):
+                await invoke_stream(app, send, asgi_version=asgi_version)
         else:
-            await invoke_stream(app, send)
+            await invoke_stream(app, send, asgi_version=asgi_version)
     finally:
         monkeypatch.undo()
         logging.getLogger().removeHandler(handler)
@@ -130,7 +139,7 @@ async def test_real_stream_logs_outcome_without_changing_status_capture_or_clean
             await active_db.engine.dispose()
     assert statuses == [200]
     assert fragments.closed
-    if case not in {"read_error", "disconnect", "send_error", "cancel"}:
+    if case not in {"read_error", "disconnect", "send_error", "send_broken_pipe", "cancel"}:
         assert b"".join(bodies) == b"".join(chunks)
     records = [json.loads(line) for line in output.getvalue().splitlines()]
     finals = [record for record in records if record["event"] == "request_completed"]
