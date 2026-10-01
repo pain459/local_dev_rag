@@ -35,8 +35,8 @@ _UNRESOLVED = re.compile(
     r"\b(either|or|neither|whether|if|unless|never|haven['’]t|hasn['’]t|didn['’]t|did\s+not)\b",
     re.I,
 )
-# Scope markers are kept separately from clause predicates: splitting a comma or
-# entering an infinitive must never strip uncertainty from the governing clause.
+# Conditional statements are excluded before clause parsing, regardless of their
+# predicates or connectors. Omission is safer than guessing consequent scope.
 _CONDITION = re.compile(
     r"\b(?:if|unless|when|once|provided(?:\s+that)?|providing(?:\s+that)?"
     r"|assuming|as\s+long\s+as|in\s+case|on\s+condition\s+that)\b",
@@ -142,16 +142,14 @@ def _terms(text: str) -> set[str]:
 
 def _nominal_terms(text: str) -> set[str]:
     """Only identifier lists are eligible, never unknown verbs or alternatives."""
-    subject = _CONDITION.split(text, maxsplit=1)[0]
-    subject = _CONTEXT.split(subject, maxsplit=1)[0].strip(" \t\"'{}:,")
+    subject = _CONTEXT.split(text, maxsplit=1)[0].strip(" \t\"'{}:,")
     options = re.split(r"\s*(?:,\s*(?:and\s+)?|\band\b)\s*", subject)
     return _terms(subject) if all(_NOMINAL.fullmatch(option) for option in options) else set()
 
 
 def _evidence_clauses(statement: str) -> list[str]:
     """Keep a nominal list and its qualifiers under one governing predicate."""
-    # An incidental comma after a conjunction does not attach its following
-    # condition to the preceding assertion ("PostgreSQL and, if ..., Redis").
+    # An incidental comma after a conjunction is not another clause boundary.
     statement = re.sub(r"\b(and|but|while|whereas|however)\s*,\s*", r"\1 ", statement, flags=re.I)
     parts = _CLAUSES.split(statement)
     clauses: list[str] = []
@@ -160,15 +158,10 @@ def _evidence_clauses(statement: str) -> list[str]:
         connector, following = parts[index : index + 2]
         # Only a new predicate or explicit negation/infinitive opens a clause.
         # Thus "Redis, PostgreSQL, or MongoDB" is checked as one uncertain list.
-        independent = (
-            _PREDICATE.search(following)
-            or _CONDITION.match(following.strip())
-            or re.match(r"^\s*(?:not|neither|(?:to\s+)?use)\b", following, re.I)
+        independent = _PREDICATE.search(following) or re.match(
+            r"^\s*(?:not|neither|(?:to\s+)?use)\b", following, re.I
         )
-        # A trailing comma condition qualifies the current predicate; a condition
-        # after "and" instead opens the scope of the next coordinated action.
-        trailing_condition = connector == "," and _CONDITION.match(following.strip())
-        if connector.casefold() in {"and", ","} and (not independent or trailing_condition):
+        if connector.casefold() in {"and", ","} and not independent:
             current += " " + connector + " " + following
         else:
             clauses.extend((current, connector))
@@ -279,18 +272,6 @@ def _fact_terms(text: str) -> set[str]:
     }
 
 
-def _complete_action_clause(clause: str) -> bool:
-    """A new predicate alone is coordination, not a complete consequent."""
-    predicate = _PREDICATE.search(clause)
-    if predicate is None:
-        return False
-    prefix = clause[: predicate.start()]
-    return bool(
-        re.match(r"^\s*(?:we|i|they|the team|the project)\b", prefix, re.I)
-        or _PASSIVE_PREFIX.fullmatch(prefix)
-    )
-
-
 def _option_evidence(
     records: list[dict[str, object]],
 ) -> tuple[set[str], set[str], list[set[str]]]:
@@ -299,63 +280,26 @@ def _option_evidence(
     for record in records:
         excerpt = _normalize_negation(_excerpt_text(cast(str, record["excerpt"])))
         for statement in re.split(r"[.!?;\n]", excerpt):
+            # A conditional statement contributes no selections or facts and
+            # cannot revoke certain evidence from another statement. Apply this
+            # before splitting clauses so no grammar path can discard its scope.
+            if _CONDITION.search(statement):
+                continue
             decision_frame = False
-            conditional = False
-            condition_governed = False
-            antecedent = False
             inherited: Polarity | None = None
             previous: set[str] = set()
-            clauses = _evidence_clauses(statement)
-            # A serial antecedent may contain several predicate-bearing commas.
-            # Only its final complete comma-delimited action can introduce the
-            # consequent; bare predicates/context fragments remain coordinated.
-            consequent_boundaries = {
-                index
-                for index, clause in enumerate(clauses[:-1])
-                if clause == "," and _complete_action_clause(clauses[index + 1])
-            }
-            consequent_boundary = max(consequent_boundaries, default=-1)
-            for index, clause in enumerate(clauses):
+            for clause in _evidence_clauses(statement):
                 connector = " ".join(clause.split()).casefold()
                 if connector in {"instead of", "rather than"}:
                     inherited = "rejected"
                     continue
                 if connector in {"and", ",", "but", "while", "whereas", "however"}:
-                    if connector == "," and index == consequent_boundary:
-                        antecedent = False
                     if connector not in {"and", ","}:
                         inherited = None
                         decision_frame = False
-                        if not conditional or condition_governed:
-                            conditional = False
-                            condition_governed = False
-                            antecedent = False
                     continue
                 status, subjects = _clause_evidence(clause, inherited, previous, decision_frame)
-                condition = _CONDITION.search(clause)
-                if condition:
-                    conditional = True
-                    condition_governed = False
-                    action = _PREDICATE.search(clause) or re.match(
-                        r"^\s*(?:not\s+)?(?:to\s+)?use\b", clause, re.I
-                    )
-                    # A condition before the action introduces an antecedent,
-                    # even after a context phrase. A trailing condition instead
-                    # qualifies the action already parsed in this clause.
-                    antecedent = antecedent or action is None or condition.start() < action.start()
-                # Nested connectors belong to the condition until a supported
-                # action consumes it. A later independently governed sibling may
-                # then start its own scope, including after "while" or "but".
-                if (
-                    conditional
-                    and not antecedent
-                    and subjects
-                    and status in {"selected", "rejected"}
-                ):
-                    condition_governed = True
-                uncertain = bool(
-                    conditional or _SPECULATIVE.search(clause) or _UNCERTAIN.search(clause)
-                )
+                uncertain = bool(_SPECULATIVE.search(clause) or _UNCERTAIN.search(clause))
                 # This is the single affirmation boundary for *all* parse paths,
                 # including predicates, coordinated infinitives and bare lists.
                 if status == "selected" and (uncertain or _UNRESOLVED.search(clause)):

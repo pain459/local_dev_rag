@@ -777,15 +777,15 @@ async def test_factual_grounding_does_not_turn_mentions_or_conditions_into_usage
         "We selected PostgreSQL and use Redis provided that the benchmark succeeds.",
     ],
 )
-async def test_a_certain_sibling_survives_without_an_earlier_confirmation(evidence):
+async def test_conditional_statement_omits_same_statement_selected_siblings(evidence):
     instance = curator(
         lambda request: response(
             json.dumps({"memories": [candidate(text="Use Redis."), candidate()]})
         )
     )
-    assert await instance.extract(source(evidence)) == [
-        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
-    ]
+    # Fail closed as a whole statement: a selected sibling must be restated
+    # unconditionally before it can contribute durable evidence.
+    assert await instance.extract(source(evidence)) == []
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -897,7 +897,7 @@ async def test_fronted_condition_survives_nested_context_connectors(kind, connec
 
 
 @pytest.mark.parametrize("connector", ["but", "while", "whereas", "however"])
-async def test_certain_sibling_after_governed_conditional_action_remains_usable(connector):
+async def test_connector_after_conditional_action_cannot_restore_certain_evidence(connector):
     instance = curator(
         lambda request: response(
             json.dumps(
@@ -906,9 +906,7 @@ async def test_certain_sibling_after_governed_conditional_action_remains_usable(
         )
     )
     evidence = f"If the benchmark succeeds, we will use Redis {connector} we selected PostgreSQL."
-    assert await instance.extract(source(evidence)) == [
-        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
-    ]
+    assert await instance.extract(source(evidence)) == []
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -1064,7 +1062,7 @@ async def test_second_antecedent_predicate_stays_inside_condition_until_conseque
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("predicate", ["rejected", "did not use", "didn't use", "didn’t use"])
 @pytest.mark.parametrize("connector", ["but", "while", "whereas", "however"])
-async def test_antecedent_predicate_does_not_hide_certain_sibling_after_consequent(
+async def test_conditional_statement_omits_selected_sibling_after_consequent(
     kind, predicate, connector
 ):
     instance = curator(
@@ -1083,9 +1081,7 @@ async def test_antecedent_predicate_does_not_hide_certain_sibling_after_conseque
         f"If we {predicate} MongoDB but latency remains high, we will use Redis "
         f"{connector} we selected PostgreSQL."
     )
-    assert await instance.extract(source(evidence)) == [
-        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
-    ]
+    assert await instance.extract(source(evidence)) == []
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -1137,7 +1133,7 @@ async def test_context_before_fronted_condition_does_not_make_antecedent_a_conse
 
 
 @pytest.mark.parametrize("kind", KINDS)
-async def test_trailing_condition_on_infinitive_keeps_independent_certain_sibling(kind):
+async def test_trailing_condition_on_infinitive_omits_entire_statement(kind):
     instance = curator(
         lambda request: response(
             json.dumps(
@@ -1154,10 +1150,7 @@ async def test_trailing_condition_on_infinitive_keeps_independent_certain_siblin
     evidence = (
         "We selected PostgreSQL and use Redis if the benchmark succeeds, but we selected NATS."
     )
-    assert await instance.extract(source(evidence)) == [
-        MemoryDraft(kind, "Use NATS.", 0.9, 0.8),
-        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8),
-    ]
+    assert await instance.extract(source(evidence)) == []
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -1237,9 +1230,7 @@ async def test_serial_antecedent_commas_and_context_keep_governed_action_conditi
     "consequent", ["we will use Redis", "we selected Redis", "we rejected Redis"]
 )
 @pytest.mark.parametrize("connector", ["but", "while", "whereas", "however"])
-async def test_true_consequent_comma_allows_independent_certain_sibling(
-    kind, consequent, connector
-):
+async def test_true_consequent_comma_cannot_restore_certain_evidence(kind, consequent, connector):
     instance = curator(
         lambda request: response(
             json.dumps(
@@ -1255,9 +1246,7 @@ async def test_true_consequent_comma_allows_independent_certain_sibling(
     evidence = (
         f"If we selected MongoDB, rejected NATS, {consequent}, {connector} we selected PostgreSQL."
     )
-    assert await instance.extract(source(evidence)) == [
-        MemoryDraft(kind, "Use PostgreSQL.", 0.9, 0.8)
-    ]
+    assert await instance.extract(source(evidence)) == []
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -1273,4 +1262,118 @@ async def test_unconditional_serial_predicate_commas_preserve_certain_decision(k
     evidence = f"We selected MongoDB, {predicate} NATS, but we selected PostgreSQL."
     assert await instance.extract(source(evidence)) == [
         MemoryDraft(kind, "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("connector", ["and", "but", "while", "whereas", "however"])
+@pytest.mark.parametrize("context", ["", "For caching, ", "In this project, "])
+async def test_present_tense_consequent_cannot_escape_conditional_statement(
+    kind, connector, context
+):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(kind=kind, text="Use Redis."),
+                        candidate(kind=kind, text="Use MongoDB."),
+                        candidate(kind=kind, text="Use NATS."),
+                        candidate(text="Use PostgreSQL."),
+                    ]
+                }
+            )
+        )
+    )
+    evidence = (
+        f"We selected PostgreSQL. {context}If we selected MongoDB, we rejected NATS "
+        f"{connector} latency remains high, we use Redis."
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "if",
+        "IF",
+        "unless",
+        "when",
+        "once",
+        "provided",
+        "provided that",
+        "providing",
+        "providing that",
+        "assuming",
+        "assuming that",
+        "as long as",
+        "in case",
+        "on condition that",
+    ],
+)
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "{condition} the benchmark succeeds, we use Redis",
+        "{condition} we selected MongoDB, we rejected NATS but latency remains high, we use Redis",
+        "For caching, {condition} the benchmark succeeds, Redis restarted successfully",
+        "We selected Redis but {condition} the benchmark succeeds, we will use MongoDB",
+        "Redis restarted successfully and we selected Redis {condition} the benchmark succeeds",
+        "{condition} the benchmark succeeds, Redis is not used for caching",
+    ],
+)
+async def test_conditional_statement_contributes_neither_selection_nor_fact_coverage(
+    kind, condition, statement
+):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(kind=kind, text="Use Redis."),
+                        candidate(kind=kind, text="Redis restarted successfully."),
+                        candidate(kind=kind, text="Redis is not used for caching."),
+                        candidate(kind=kind, text="Use MongoDB."),
+                        candidate(kind=kind, text="Use NATS."),
+                    ]
+                }
+            )
+        )
+    )
+    assert await instance.extract(source(statement.format(condition=condition) + ".")) == []
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("separator", [". ", "! ", "? ", "; ", "\n"])
+@pytest.mark.parametrize("certain_first", [True, False])
+@pytest.mark.parametrize(
+    ("certain", "text"),
+    [
+        ("We selected PostgreSQL", "Use PostgreSQL."),
+        ("PostgreSQL restarted successfully", "PostgreSQL restarted successfully."),
+        ("PostgreSQL isn't used for caching", "PostgreSQL is not used for caching."),
+    ],
+)
+async def test_separate_unconditional_statements_remain_usable(
+    kind, separator, certain_first, certain, text
+):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(kind=kind, text="Use Redis."),
+                        candidate(kind=kind, text=text),
+                    ]
+                }
+            )
+        )
+    )
+    conditional = "If we rejected PostgreSQL but latency remains high, we use Redis"
+    statements = [certain, conditional] if certain_first else [conditional, certain]
+    assert await instance.extract(source(separator.join(statements) + ".")) == [
+        MemoryDraft(kind, text, 0.9, 0.8)
     ]
