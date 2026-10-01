@@ -11,7 +11,11 @@ FROM python:3.12-slim-bookworm AS production
 RUN groupadd --gid 10001 app && useradd --uid 10001 --gid app --no-create-home app
 WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
+COPY --chown=app:app alembic.ini ./alembic.ini
+COPY --chown=app:app migrations ./migrations
+COPY --chown=app:app scripts/start-service.sh ./scripts/start-service.sh
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 USER app
 EXPOSE 8080
-CMD ["uvicorn", "local_dev_rag.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]
+ENTRYPOINT ["/bin/sh", "/app/scripts/start-service.sh"]
+CMD ["uvicorn", "local_dev_rag.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]

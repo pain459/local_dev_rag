@@ -11,13 +11,15 @@ from pydantic import BaseModel
 from local_dev_rag.config import Settings, get_settings
 from local_dev_rag.db import Database
 from local_dev_rag.domain import InvalidRequestError, RequestIdentity
+from local_dev_rag.logging import RequestLoggingMiddleware, compact_id, configure_logging
 from local_dev_rag.models import ModelRegistry, UnknownModelError
 from local_dev_rag.ollama import OllamaClient
 from local_dev_rag.proxy import MemorySearch, ProxyService
+from local_dev_rag.readiness import HealthProbe, ReadinessService
 from local_dev_rag.repository import PostgresCaptureStore, PostgresMemorySearch
 from local_dev_rag.vector_store import VectorStore
 
-DependencyState = Literal["unknown", "healthy", "unhealthy"]
+DependencyState = Literal["healthy", "degraded", "unavailable"]
 
 
 class HealthResponse(BaseModel):
@@ -28,10 +30,13 @@ class DependencyStates(BaseModel):
     postgres: DependencyState
     chromadb: DependencyState
     ollama: DependencyState
+    curator: DependencyState
+    embedder: DependencyState
+    memory_jobs: DependencyState
 
 
 class ReadinessResponse(BaseModel):
-    status: Literal["starting", "healthy", "degraded"]
+    status: Literal["ready", "degraded", "not_ready"]
     dependencies: DependencyStates
 
 
@@ -41,6 +46,7 @@ def create_app(
     ollama_client: OllamaClient | None = None,
     database: Database | None = None,
     vector_store: MemorySearch | None = None,
+    readiness_service: ReadinessService | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
@@ -52,12 +58,20 @@ def create_app(
 
     app = FastAPI(title="Local OpenCode RAG Memory", lifespan=lifespan)
     app.state.settings = settings if settings is not None else get_settings()
+    configure_logging(app.state.settings)
+    app.add_middleware(RequestLoggingMiddleware)
     app.state.database = database or Database.create(app.state.settings)
     registry = ModelRegistry(app.state.settings)
     app.state.model_registry = registry
     app.state.ollama_client = ollama_client or OllamaClient(app.state.settings)
 
     app.state.vector_store = vector_store or VectorStore(app.state.settings)
+    app.state.readiness_service = readiness_service or ReadinessService(
+        app.state.settings,
+        database=app.state.database,
+        vector_store=cast(HealthProbe, app.state.vector_store),
+        ollama=app.state.ollama_client,
+    )
     app.state.proxy_service = ProxyService(
         app.state.settings,
         registry=registry,
@@ -87,6 +101,10 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
         identity = RequestIdentity.from_headers(request.headers)
+        request.state.log_identity = {
+            "project_id": compact_id(identity.project_id),
+            "session_id": compact_id(identity.session_id),
+        }
         try:
             payload = await request.json()
         except (ValueError, UnicodeError):
@@ -101,6 +119,7 @@ def create_app(
             registry.get(model)
         except UnknownModelError as error:
             raise InvalidRequestError(str(error), "model") from error
+        request.state.log_identity["model"] = model
         if not isinstance(payload.get("messages"), list):
             raise InvalidRequestError("messages must be an array", "messages")
         if "stream" in payload and not isinstance(payload["stream"], bool):
@@ -117,11 +136,19 @@ def create_app(
     async def health() -> HealthResponse:
         return HealthResponse()
 
-    @app.get("/readyz", response_model=ReadinessResponse)
-    async def readiness() -> ReadinessResponse:
-        return ReadinessResponse(
-            status="starting",
-            dependencies=DependencyStates(postgres="unknown", chromadb="unknown", ollama="unknown"),
+    @app.get(
+        "/readyz", response_model=ReadinessResponse, responses={503: {"model": ReadinessResponse}}
+    )
+    async def readiness() -> JSONResponse:
+        report = await cast(ReadinessService, app.state.readiness_service).check()
+        response = ReadinessResponse(
+            status=report.status,
+            dependencies=DependencyStates.model_validate(
+                {name: result.state for name, result in report.dependencies.items()}
+            ),
+        )
+        return JSONResponse(
+            status_code=503 if report.status == "not_ready" else 200, content=response.model_dump()
         )
 
     return app

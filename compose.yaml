@@ -2,6 +2,7 @@ x-app: &app
   build: .
   image: local-dev-rag:local
   restart: unless-stopped
+  entrypoint: ["/bin/sh", "/app/scripts/start-service.sh"]
   env_file:
     - path: .env
       required: false
@@ -23,10 +24,26 @@ x-app: &app
 services:
   proxy:
     <<: *app
+    command: ["uvicorn", "local_dev_rag.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
     ports:
       - "127.0.0.1:${PROXY_PORT:-8080}:8080"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import json, urllib.request, urllib.error
+          assert json.load(urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)) == {'status': 'ok'}
+          try:
+              ready = urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3)
+          except urllib.error.HTTPError as error:
+              if error.code != 503:
+                  raise
+              ready = error
+          report = json.load(ready)
+          assert report['status'] in ('ready', 'degraded', 'not_ready')
+          assert isinstance(report['dependencies'], dict)
       interval: 10s
       timeout: 5s
       retries: 3
@@ -34,13 +51,21 @@ services:
 
   worker:
     <<: *app
-    # Task 8 replaces this idle skeleton with the durable job worker.
-    command: ["python", "-c", "import time; time.sleep(10**9)"]
+    command: ["python", "-m", "local_dev_rag.worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chromadb:
+        condition: service_healthy
+      proxy:
+        # Serializes initial Alembic migrations and remains independent of Ollama readiness.
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "from pathlib import Path; assert b'time.sleep(10**9)' in Path('/proc/1/cmdline').read_bytes()"]
+      test: ["CMD", "python", "-m", "local_dev_rag.worker", "--healthcheck"]
       interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 15s
 
   postgres:
     image: postgres:16-bookworm

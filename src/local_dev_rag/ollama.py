@@ -10,6 +10,7 @@ from anyio import CancelScope
 
 from local_dev_rag.config import Settings
 from local_dev_rag.domain import DependencyStatus, UpstreamResponse
+from local_dev_rag.logging import error_category
 
 
 class OllamaClient:
@@ -80,11 +81,40 @@ class OllamaClient:
             with CancelScope(shield=True):
                 await stack.aclose()
 
+    async def _available_models(self) -> set[str]:
+        async with self._client() as client:
+            response = await client.get("/api/tags")
+            response.raise_for_status()
+            payload: object = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid health response")
+        models = cast(dict[str, object], payload).get("models")
+        if not isinstance(models, list):
+            raise ValueError("Invalid health response")
+        names: set[str] = set()
+        for model in cast(list[object], models):
+            if not isinstance(model, dict):
+                raise ValueError("Invalid health response")
+            name = cast(dict[str, object], model).get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("Invalid health response")
+            names.add(name)
+        return names
+
     async def health(self) -> DependencyStatus:
         try:
-            async with self._client() as client:
-                response = await client.get("/api/tags")
-                response.raise_for_status()
+            await self._available_models()
             return DependencyStatus("ollama", "healthy")
         except httpx.HTTPError as error:
-            return DependencyStatus("ollama", "unavailable", str(error))
+            return DependencyStatus("ollama", "unavailable", error_category(error))
+        except (ValueError, UnicodeError):
+            return DependencyStatus("ollama", "unavailable", "invalid_health_response")
+
+    async def model_health(self, model: str, name: str) -> DependencyStatus:
+        try:
+            models = await self._available_models()
+            return DependencyStatus(name, "healthy" if model in models else "degraded")
+        except httpx.HTTPError as error:
+            return DependencyStatus(name, "unavailable", error_category(error))
+        except (ValueError, UnicodeError):
+            return DependencyStatus(name, "unavailable", "invalid_health_response")

@@ -1,11 +1,15 @@
 """Asynchronous semantic-memory processing; PostgreSQL is the durable checkpoint."""
 
+import argparse
 import asyncio
+import json
 import logging
 import signal
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from math import isfinite
+from pathlib import Path
+from time import perf_counter
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -14,9 +18,11 @@ from local_dev_rag.curator import Curator
 from local_dev_rag.db import Database
 from local_dev_rag.domain import EmbeddedMemory, MemoryItem, MemoryJob
 from local_dev_rag.jobs import JobRepository
+from local_dev_rag.logging import configure_logging, error_category
 from local_dev_rag.ollama import OllamaClient
+from local_dev_rag.readiness import ReadinessService
 from local_dev_rag.repository import ConversationRepository, MemoryRepository
-from local_dev_rag.vector_store import VectorStore
+from local_dev_rag.vector_store import VectorStore, VectorStoreUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -111,10 +117,19 @@ class Worker:
             logger.warning("memory_job_lease_lost", extra={"job_id": str(job.id)})
 
     async def run_once(self) -> WorkResult:
+        started = perf_counter()
         job = await self.jobs.claim(self.worker_id, self.lease_seconds)
         if job is None:
             return WorkResult("idle", None, 0)
         count = 0
+        dependency = "postgres"
+        fields: dict[str, object] = {
+            "job_id": str(job.id),
+            "project_id": str(job.project_id),
+            "session_id": str(job.session_id),
+            "retry_count": job.attempt_count - 1,
+            "attempt_count": job.attempt_count,
+        }
         try:
             # Leave time to transition failure before the durable lease expires.
             async with asyncio.timeout(self.lease_seconds - 1):
@@ -124,7 +139,9 @@ class Worker:
                     )
                     stored = await MemoryRepository(session).for_source(source)
                 if not stored:
+                    dependency = "curator"
                     drafts = await self.curator.extract(source)
+                    dependency = "postgres"
                     async with self.database.session() as session:
                         stored = await MemoryRepository(session).persist(
                             source,
@@ -133,6 +150,7 @@ class Worker:
                         )
                 active = [item for item in stored if item.state == "active"]
                 count = len(active)
+                dependency = "embedder"
                 await index_memories(
                     self.database,
                     self.settings,
@@ -141,7 +159,18 @@ class Worker:
                     active,
                     batch_size=self.batch_size,
                 )
+                dependency = "postgres"
                 await self.jobs.complete(job.id, [item.id for item in active])
+            logger.info(
+                "memory_job_completed",
+                extra={
+                    **fields,
+                    "model": self.settings.curator_model,
+                    "memory_count": count,
+                    "duration_ms": (perf_counter() - started) * 1000,
+                    "degraded_dependencies": [],
+                },
+            )
             return WorkResult("completed", job.id, count)
         except asyncio.CancelledError as error:
             cleanup = asyncio.create_task(self._fail(job, error))
@@ -152,6 +181,19 @@ class Worker:
             raise
         except Exception as error:
             await self._fail(job, error)
+            if isinstance(error, VectorStoreUnavailable):
+                dependency = "chromadb"
+            logger.warning(
+                "memory_job_failed",
+                extra={
+                    **fields,
+                    "model": self.settings.curator_model,
+                    "memory_count": count,
+                    "duration_ms": (perf_counter() - started) * 1000,
+                    "error_category": error_category(error),
+                    "degraded_dependencies": [dependency],
+                },
+            )
             state = "failed" if job.attempt_count >= self.settings.retry_max_attempts else "retry"
             return WorkResult(state, job.id, count)
 
@@ -172,6 +214,7 @@ class Worker:
 
 async def serve() -> None:
     settings = Settings()
+    configure_logging(settings)
     database = Database.create(settings)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -183,7 +226,46 @@ async def serve() -> None:
         await database.engine.dispose()
 
 
+async def healthcheck() -> int:
+    try:
+        command = Path("/proc/1/cmdline").read_bytes().split(b"\0")
+        running = [b"-m", b"local_dev_rag.worker"] == command[1:3]
+    except OSError:
+        running = False
+    if not running:
+        print(json.dumps({"status": "not_running"}))
+        return 1
+    settings = Settings()
+    configure_logging(settings)
+    database = Database.create(settings)
+    try:
+        report = await ReadinessService(
+            settings,
+            database=database,
+            vector_store=VectorStore(settings),
+            ollama=OllamaClient(settings),
+        ).check()
+        print(
+            json.dumps(
+                {
+                    "status": report.status,
+                    "dependencies": {
+                        name: result.state for name, result in report.dependencies.items()
+                    },
+                }
+            )
+        )
+        # Optional inference/index failures do not make a recoverable worker process dead.
+        return 1 if report.dependencies["postgres"].state == "unavailable" else 0
+    finally:
+        await database.engine.dispose()
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Process durable memory jobs")
+    parser.add_argument("--healthcheck", action="store_true")
+    if parser.parse_args().healthcheck:
+        raise SystemExit(asyncio.run(healthcheck()))
     asyncio.run(serve())
 
 

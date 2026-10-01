@@ -5,6 +5,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime
 from hashlib import sha256
+from typing import cast
 from uuid import UUID
 
 import httpx
@@ -12,7 +13,8 @@ from anyio import CancelScope
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from local_dev_rag.config import Settings
-from local_dev_rag.domain import EmbeddedMemory, MemoryItem, VectorHit
+from local_dev_rag.domain import DependencyStatus, EmbeddedMemory, MemoryItem, VectorHit
+from local_dev_rag.logging import error_category
 
 
 class VectorStoreUnavailable(RuntimeError):
@@ -65,6 +67,25 @@ class VectorStore:
             else f"local_dev_rag_memory_v{settings.embedding_version}_{model_key}"
         )
         self._transport = transport
+
+    async def health(self) -> DependencyStatus:
+        try:
+            async with self._client() as client:
+                response = await client.get("/api/v1/heartbeat")
+                response.raise_for_status()
+                payload: object = response.json()
+            heartbeat = (
+                cast(dict[str, object], payload).get("nanosecond heartbeat")
+                if isinstance(payload, dict)
+                else None
+            )
+            if isinstance(heartbeat, bool) or not isinstance(heartbeat, int) or heartbeat < 0:
+                return DependencyStatus("chromadb", "unavailable", "invalid_health_response")
+            return DependencyStatus("chromadb", "healthy")
+        except httpx.HTTPError as error:
+            return DependencyStatus("chromadb", "unavailable", error_category(error))
+        except (ValueError, UnicodeError):
+            return DependencyStatus("chromadb", "unavailable", "invalid_health_response")
 
     @asynccontextmanager
     async def _client(self) -> AsyncGenerator[httpx.AsyncClient]:

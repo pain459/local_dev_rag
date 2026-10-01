@@ -34,6 +34,7 @@ from local_dev_rag.domain import (
 )
 from local_dev_rag.domain import Scope as ConversationScope
 from local_dev_rag.events import json_value, normalize_messages
+from local_dev_rag.logging import compact_id
 from local_dev_rag.models import ModelRegistry, ModelSpec
 from local_dev_rag.ollama import OllamaClient
 from local_dev_rag.ranking import rank_memories
@@ -257,7 +258,13 @@ class ProxyService:
             state["capture_status"] = capture.status
         except CaptureUnavailable:
             degraded.append("postgres")
-            logger.warning("PostgreSQL unavailable; forwarding the full request without capture")
+            logger.warning(
+                "dependency_unavailable",
+                extra={
+                    "degraded_dependencies": ["postgres"],
+                    "error_category": "processing_error",
+                },
+            )
         payload = cast(dict[str, object], json_value(request))
         candidates: list[MemoryCandidate] = []
         injected_tokens = 0
@@ -315,11 +322,11 @@ class ProxyService:
             diagnostics = ProxyDiagnostics(len(candidates), injected_tokens, tuple(degraded))
             state["proxy_diagnostics"] = diagnostics
             logger.info(
-                "Foreground memory context",
+                "foreground_context",
                 extra={
-                    "request_id": request_id,
-                    "project_id": identity.project_id,
-                    "session_id": identity.session_id,
+                    "request_id": state.get("correlation_id", request_id),
+                    "project_id": compact_id(identity.project_id),
+                    "session_id": compact_id(identity.session_id),
                     "model": model,
                     "retrieval_count": diagnostics.retrieval_count,
                     "injected_memory_tokens": injected_tokens,
