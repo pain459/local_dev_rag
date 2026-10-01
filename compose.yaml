@@ -1,0 +1,78 @@
+x-app: &app
+  build: .
+  image: local-dev-rag:local
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    PROXY_HOST: 0.0.0.0
+    # Container network bind is required; only the host loopback port is published.
+    ALLOW_REMOTE_BIND: "true"
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-local_rag}:${POSTGRES_PASSWORD:-local_rag}@postgres:5432/${POSTGRES_DB:-local_rag}
+    CHROMADB_URL: http://chromadb:8000
+    OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  depends_on:
+    postgres:
+      condition: service_healthy
+    chromadb:
+      condition: service_healthy
+
+services:
+  proxy:
+    <<: *app
+    ports:
+      - "127.0.0.1:${PROXY_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  worker:
+    <<: *app
+    # Task 8 replaces this idle skeleton with the durable job worker.
+    command: ["python", "-c", "import time; time.sleep(10**9)"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "from pathlib import Path; assert b'time.sleep(10**9)' in Path('/proc/1/cmdline').read_bytes()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-local_rag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_rag}
+      POSTGRES_DB: ${POSTGRES_DB:-local_rag}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  chromadb:
+    image: chromadb/chroma:0.6.3
+    restart: unless-stopped
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - chroma_data:/chroma/chroma
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/heartbeat', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  postgres_data:
+  chroma_data:
