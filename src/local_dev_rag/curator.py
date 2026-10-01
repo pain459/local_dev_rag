@@ -30,8 +30,12 @@ _CONFIRMED = re.compile(
 )
 _REJECTED = re.compile(
     r"\b(not\s+(?:to\s+)?(?:use|select(?:ed)?|choose|chosen)"
+    r"|didn['’]t\s+(?:use|select|choose)|decided\s+against"
     r"|reject(?:ed)?|ruled\s+out|declined|avoid)\b",
     re.I,
+)
+_MENTIONED = re.compile(
+    r"\b(available|evaluated|considered|investigated|option|alternative)\b", re.I
 )
 _SECRET = re.compile(
     r"(?:\b(?:api[ _-]?key|(?:access|refresh|auth)[ _-]?token|(?:client[ _-]?)?secret"
@@ -101,25 +105,80 @@ def _terms(text: str) -> set[str]:
 
 
 def _unselected_terms(records: list[dict[str, object]]) -> tuple[bool, set[str]]:
-    """Conservatively reject subjects found only in speculative source statements.
+    """Track selected, mentioned, speculative and rejected option subjects by clause.
 
     This complements the prompt: a rewording without 'maybe' must not turn an
     unselected alternative into a decision when a different decision is confirmed.
+    Context phrases are excluded from subject terms so a rejected option's rationale
+    cannot suppress a separate selected option with the same rationale.
     """
     selected: set[str] = set()
     unselected: set[str] = set()
     rejected: set[str] = set()
     for record in records:
         for statement in re.split(r"[.!?;\n]", cast(str, record["excerpt"])):
-            terms = _terms(statement)
-            if _REJECTED.search(statement):
-                rejected.update(terms)
-                selected.difference_update(terms)
-            elif _SPECULATIVE.search(statement):
-                unselected.update(terms)
-            elif _CONFIRMED.search(statement):
-                selected.update(terms)
-                rejected.difference_update(terms)
+            inherited: str | None = None
+            # Coordination scopes each predicate independently. Only bare nominal
+            # lists joined by 'and'/commas can inherit the preceding predicate.
+            for clause in re.split(
+                r"(\b(?:and|but|while|whereas|however|instead\s+of|rather\s+than)\b|,)",
+                statement,
+            ):
+                connector = " ".join(clause.split()).casefold()
+                if connector in {"instead of", "rather than"}:
+                    inherited = "rejected"
+                    continue
+                if connector in {"and", ",", "but", "while", "whereas", "however"}:
+                    if connector not in {"and", ","}:
+                        inherited = None
+                    continue
+                subject = re.split(
+                    r"\b(for|because|since|when|with)\b", clause, maxsplit=1, flags=re.I
+                )[0]
+                terms = _terms(subject) - {
+                    "available",
+                    "evaluated",
+                    "considered",
+                    "investigated",
+                    "option",
+                    "alternative",
+                    "decided",
+                    "chose",
+                    "chosen",
+                    "will",
+                    "only",
+                    "later",
+                    "then",
+                    "rejected",
+                    "confirmed",
+                    "agreed",
+                    "fixed",
+                    "completed",
+                    "must",
+                    "required",
+                    "they",
+                    "i",
+                }
+                status: str | None = None
+                if _REJECTED.search(clause):
+                    status = "rejected"
+                elif _SPECULATIVE.search(clause) or _MENTIONED.search(clause):
+                    status = "unselected"
+                elif _CONFIRMED.search(clause):
+                    status = "selected"
+                elif inherited and re.fullmatch(
+                    r"[\w-]+(?:\s+[\w-]+){0,3}", subject.strip(" \t\"'{}:")
+                ):
+                    status = inherited
+                if status == "rejected":
+                    rejected.update(terms)
+                    selected.difference_update(terms)
+                elif status == "unselected":
+                    unselected.update(terms)
+                elif status == "selected":
+                    selected.update(terms)
+                    rejected.difference_update(terms)
+                inherited = status
     excluded = (unselected | rejected) - selected
     return bool(excluded) and not selected, excluded
 

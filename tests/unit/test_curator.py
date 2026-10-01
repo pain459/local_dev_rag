@@ -366,3 +366,83 @@ async def test_explicit_confirmation_allows_an_evaluated_or_speculative_option(e
     assert await instance.extract(source(evidence)) == [
         MemoryDraft("decision", "Use Redis.", 0.9, 0.8)
     ]
+
+
+@pytest.mark.parametrize(
+    "mention",
+    [
+        "Redis is available.",
+        "We evaluated Redis.",
+        "Redis was evaluated for durable memory.",
+    ],
+)
+@pytest.mark.parametrize("decision_first", [False, True])
+async def test_neutral_option_is_not_promoted_beside_a_confirmed_sibling(mention, decision_first):
+    confirmed = "We decided to use PostgreSQL for durable memory."
+    evidence = (confirmed + " " + mention) if decision_first else (mention + " " + confirmed)
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [candidate(text="Use Redis."), candidate()],
+                }
+            )
+        )
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "We decided not to use Redis and will use PostgreSQL for durable memory.",
+        "We will use PostgreSQL for durable memory and decided not to use Redis.",
+        "We will use PostgreSQL for durable memory but rejected Redis for durable memory.",
+        "We evaluated Redis but chose PostgreSQL for durable memory.",
+        "Redis is available, but PostgreSQL was selected for durable memory.",
+        "We chose PostgreSQL for durable memory while Redis was only evaluated.",
+        "We evaluated Redis and will use PostgreSQL instead of Redis for durable memory.",
+        "We selected PostgreSQL rather than Redis for durable memory.",
+        "We decided against Redis and will use PostgreSQL for durable memory.",
+        "We didn't choose Redis and will use PostgreSQL for durable memory.",
+    ],
+)
+async def test_positive_and_negative_clauses_apply_only_to_their_own_option(evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [candidate(text="Use Redis."), candidate()],
+                }
+            )
+        )
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "We evaluated Redis and later selected Redis.",
+        "Redis is available; we decided to use Redis.",
+        "We selected Redis. Redis is available.",
+        "We selected PostgreSQL and Redis for durable memory.",
+    ],
+)
+async def test_explicit_selection_is_preserved_across_mentions_and_selected_option_lists(evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [candidate(text="Use Redis.")],
+                }
+            )
+        )
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use Redis.", 0.9, 0.8)
+    ]
