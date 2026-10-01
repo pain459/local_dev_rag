@@ -290,6 +290,7 @@ def _option_evidence(
             decision_frame = False
             conditional = False
             condition_governed = False
+            antecedent = False
             inherited: Polarity | None = None
             previous: set[str] = set()
             for clause in _evidence_clauses(statement):
@@ -298,21 +299,41 @@ def _option_evidence(
                     inherited = "rejected"
                     continue
                 if connector in {"and", ",", "but", "while", "whereas", "however"}:
+                    if connector == ",":
+                        # Clause splitting emits this delimiter only at a new
+                        # clause, retaining nominal lists/incidental commas.
+                        # Predicates before it belong to the fronted condition;
+                        # predicates after it can govern the consequent.
+                        antecedent = False
                     if connector not in {"and", ","}:
                         inherited = None
                         decision_frame = False
                         if not conditional or condition_governed:
                             conditional = False
                             condition_governed = False
+                            antecedent = False
                     continue
                 status, subjects = _clause_evidence(clause, inherited, previous, decision_frame)
-                if _CONDITION.search(clause):
+                condition = _CONDITION.search(clause)
+                if condition:
                     conditional = True
                     condition_governed = False
+                    action = _PREDICATE.search(clause) or re.match(
+                        r"^\s*(?:not\s+)?(?:to\s+)?use\b", clause, re.I
+                    )
+                    # A condition before the action introduces an antecedent,
+                    # even after a context phrase. A trailing condition instead
+                    # qualifies the action already parsed in this clause.
+                    antecedent = antecedent or action is None or condition.start() < action.start()
                 # Nested connectors belong to the condition until a supported
                 # action consumes it. A later independently governed sibling may
                 # then start its own scope, including after "while" or "but".
-                if conditional and subjects and status in {"selected", "rejected"}:
+                if (
+                    conditional
+                    and not antecedent
+                    and subjects
+                    and status in {"selected", "rejected"}
+                ):
                     condition_governed = True
                 uncertain = bool(
                     conditional or _SPECULATIVE.search(clause) or _UNCERTAIN.search(clause)
