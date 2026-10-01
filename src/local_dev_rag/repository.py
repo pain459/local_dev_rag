@@ -154,7 +154,12 @@ class ConversationRepository:
                 scope,
                 [
                     ConversationEventInput(
-                        event_type="message",
+                        event_type=(
+                            "tool_call"
+                            if completion.payload.get("tool_calls")
+                            or completion.payload.get("function_call")
+                            else "message"
+                        ),
                         role="assistant",
                         payload=completion.payload,
                         content_hash=completion.content_hash,

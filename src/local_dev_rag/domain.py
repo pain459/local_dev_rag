@@ -72,6 +72,8 @@ class ConversationEventInput:
     source_message_id: str | None = None
     model: str | None = None
     completed: bool = True
+    # Normalizers retain the preceding occurrence identity so hashes can be recomputed.
+    parent_hash: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "payload", _freeze_payload(self.payload))
