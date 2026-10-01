@@ -14,7 +14,7 @@ from local_dev_rag.domain import InvalidRequestError, RequestIdentity
 from local_dev_rag.models import ModelRegistry, UnknownModelError
 from local_dev_rag.ollama import OllamaClient
 from local_dev_rag.proxy import MemorySearch, ProxyService
-from local_dev_rag.repository import PostgresCaptureStore
+from local_dev_rag.repository import PostgresCaptureStore, PostgresMemorySearch
 from local_dev_rag.vector_store import VectorStore
 
 DependencyState = Literal["unknown", "healthy", "unhealthy"]
@@ -63,7 +63,7 @@ def create_app(
         registry=registry,
         ollama=app.state.ollama_client,
         capture_store=PostgresCaptureStore(app.state.database),
-        vector_store=app.state.vector_store,
+        vector_store=PostgresMemorySearch(app.state.database, app.state.vector_store),
     )
 
     @app.exception_handler(InvalidRequestError)

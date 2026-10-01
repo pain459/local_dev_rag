@@ -1,19 +1,19 @@
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from uuid import uuid4
 
 import anyio
 import httpx
 import pytest
-from sqlalchemy import select
+from sqlalchemy import insert, select
 
 from local_dev_rag.api import create_app
 from local_dev_rag.config import ModelBudget, Settings
 from local_dev_rag.db import Database
-from local_dev_rag.domain import EmbeddedMemory, RequestIdentity
+from local_dev_rag.domain import ConversationEventInput, EmbeddedMemory, RequestIdentity
 from local_dev_rag.ollama import OllamaClient
 from local_dev_rag.repository import ConversationRepository
-from local_dev_rag.schema import conversation_events, memory_jobs
+from local_dev_rag.schema import conversation_events, memory_items, memory_jobs
 
 from .capture_utils import Fragments, invoke_stream
 from .test_retrieval import memory
@@ -70,6 +70,30 @@ async def deliver(app, request_payload):
     return b"".join(bodies), scope["state"]
 
 
+async def persist_memories(database, scope, items):
+    """Seed authoritative provenance as well as the vector fixture's memory rows."""
+    async with database.session() as session:
+        [event] = await ConversationRepository(session).append_events(
+            scope,
+            [
+                ConversationEventInput(
+                    event_type="message",
+                    role="assistant",
+                    payload={"content": "Historical evidence"},
+                    content_hash=str(uuid4()),
+                    request_id=str(uuid4()),
+                )
+            ],
+        )
+        stored = [
+            replace(item, source_session_id=scope.session_id, source_event_id=event.id)
+            for item in items
+        ]
+        for item in stored:
+            await session.execute(insert(memory_items).values(**asdict(item)))
+    return stored
+
+
 @pytest.mark.parametrize("stream", [False, True])
 async def test_real_foreground_scope_rerank_bounded_injection_and_durable_capture(
     database,
@@ -92,6 +116,10 @@ async def test_real_foreground_scope_rerank_bounded_injection_and_durable_captur
     rejected = replace(
         memory(own_scope.project_id, "REJECTED load_widget ECONNREFUSED"), state="rejected"
     )
+    own, low_importance, rejected = await persist_memories(
+        database, own_scope, [own, low_importance, rejected]
+    )
+    [foreign] = await persist_memories(database, foreign_scope, [foreign])
     await store.upsert(
         [
             EmbeddedMemory(own, (0.9, 0.1)),
@@ -109,7 +137,19 @@ async def test_real_foreground_scope_rerank_bounded_injection_and_durable_captur
             assert body == {"model": config.embedding_model, "input": ["load_widget ECONNREFUSED"]}
             return httpx.Response(200, json={"embeddings": [[1, 0]]})
         async with database.session() as session:
-            inbound = (await session.execute(select(conversation_events))).mappings().all()
+            inbound = (
+                (
+                    await session.execute(
+                        select(conversation_events).where(
+                            conversation_events.c.session_id.not_in(
+                                [own_scope.session_id, foreign_scope.session_id]
+                            )
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
         assert len(inbound) == 4
         assert inbound[1]["payload"]["content"] == "old " * 2000
         text = json.dumps(body["messages"])
@@ -148,7 +188,20 @@ async def test_real_foreground_scope_rerank_bounded_injection_and_durable_captur
     assert state["capture_status"] == "completed"
     async with database.session() as session:
         assert len((await session.execute(select(memory_jobs))).all()) == 1
-        assert len((await session.execute(select(conversation_events))).all()) == 5
+        assert (
+            len(
+                (
+                    await session.execute(
+                        select(conversation_events).where(
+                            conversation_events.c.session_id.not_in(
+                                [own_scope.session_id, foreign_scope.session_id]
+                            )
+                        )
+                    )
+                ).all()
+            )
+            == 5
+        )
 
 
 @pytest.mark.parametrize("failure", ["chromadb", "embedder"])
@@ -315,6 +368,7 @@ async def test_low_semantic_score_omits_irrelevant_active_memory(database, chrom
             RequestIdentity("session", "project")
         )
     irrelevant = replace(memory(scope.project_id, "IRRELEVANT cosmetic preference"), importance=0)
+    [irrelevant] = await persist_memories(database, scope, [irrelevant])
     await store.upsert([EmbeddedMemory(irrelevant, (-1, 0))])
 
     def handler(request):
@@ -394,6 +448,7 @@ async def test_default_relevance_excludes_orthogonal_cosmetic_memory(database, c
             RequestIdentity("session", "project")
         )
     cosmetic = replace(memory(scope.project_id, "Prefer a blue sidebar"), importance=1)
+    [cosmetic] = await persist_memories(database, scope, [cosmetic])
     await store.upsert([EmbeddedMemory(cosmetic, (0, 1))])
     calls = []
 
@@ -424,6 +479,49 @@ async def test_default_relevance_excludes_orthogonal_cosmetic_memory(database, c
     assert state["proxy_diagnostics"].degraded_dependencies == ()
     assert state["capture_status"] == "completed"
     assert calls == ["/api/embed", "/v1/chat/completions"]
+
+
+async def test_authoritative_memory_lookup_outage_omits_recall_but_preserves_foreground(
+    database, chroma_url, monkeypatch
+):
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from local_dev_rag.repository import MemoryRepository
+    from local_dev_rag.vector_store import VectorStore
+
+    config = settings(chromadb_url=chroma_url)
+    store = VectorStore(config, collection_name=f"authority-failure-{uuid4()}")
+    async with database.session() as session:
+        scope = await ConversationRepository(session).ensure_scope(
+            RequestIdentity("old", "project")
+        )
+    [own] = await persist_memories(
+        database, scope, [memory(scope.project_id, "load_widget recovery")]
+    )
+    await store.upsert([EmbeddedMemory(own, (1, 0))])
+
+    async def unavailable(self, project_id, hits):
+        raise SQLAlchemyError("private memory failure")
+
+    monkeypatch.setattr(MemoryRepository, "resolve_hits", unavailable)
+
+    def handler(request):
+        if request.url.path == "/api/embed":
+            return httpx.Response(200, json={"embeddings": [[1, 0]]})
+        assert own.text not in request.content.decode()
+        return httpx.Response(200, json=RESULT)
+
+    app = create_app(
+        config,
+        database=database,
+        vector_store=store,
+        ollama_client=OllamaClient(config, transport=httpx.MockTransport(handler)),
+    )
+    body, state = await deliver(app, payload())
+    assert json.loads(body) == RESULT
+    assert state["capture_status"] == "completed"
+    assert state["proxy_diagnostics"].retrieval_count == 0
+    assert state["proxy_diagnostics"].degraded_dependencies == ("postgres",)
 
 
 @pytest.mark.parametrize("embedding_payload", [[], None, "invalid", 42])

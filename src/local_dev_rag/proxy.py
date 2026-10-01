@@ -294,6 +294,8 @@ class ProxyService:
                             ][: self.settings.retrieval_result_limit]
                         except VectorStoreUnavailable:
                             degraded.append("chromadb")
+                        except CaptureUnavailable:
+                            degraded.append("postgres")
                 built = self.context_builder_factory(spec).build(
                     ChatRequest(
                         model=model,

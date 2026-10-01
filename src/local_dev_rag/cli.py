@@ -27,10 +27,14 @@ async def reindex(
     async with database.session() as session:
         repository = MemoryRepository(session)
         project_id = await repository.project_id(project)
-        items = await repository.active(project_id)
     store = vector_store if vector_store is not None else VectorStore(settings)
     client = embedder if embedder is not None else OllamaClient(settings)
     await store.delete_project(project_id)
+    # Accepted rows commit before workers write vectors. Enumerating after deletion
+    # includes every completed write that deletion could have removed; later writes
+    # stay indexed independently of this rebuild's snapshot.
+    async with database.session() as session:
+        items = await MemoryRepository(session).active(project_id)
     return await index_memories(database, settings, client, store, items, batch_size=batch_size)
 
 

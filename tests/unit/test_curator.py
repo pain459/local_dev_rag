@@ -870,3 +870,126 @@ async def test_factual_support_retains_matching_positive_and_negative_polarity(k
         lambda request: response(json.dumps({"memories": [candidate(kind=kind, text=text)]}))
     )
     assert await instance.extract(source(text)) == [MemoryDraft(kind, text, 0.9, 0.8)]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("connector", ["but", "while", "whereas", "however"])
+async def test_fronted_condition_survives_nested_context_connectors(kind, connector):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(kind=kind, text="Use Redis."),
+                        candidate(text="Use PostgreSQL."),
+                    ]
+                }
+            )
+        )
+    )
+    evidence = (
+        f"We selected PostgreSQL. If the benchmark succeeds {connector} latency remains high, "
+        "we will use Redis."
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("connector", ["but", "while", "whereas", "however"])
+async def test_certain_sibling_after_governed_conditional_action_remains_usable(connector):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {"memories": [candidate(text="Use Redis."), candidate(text="Use PostgreSQL.")]}
+            )
+        )
+    )
+    evidence = f"If the benchmark succeeds, we will use Redis {connector} we selected PostgreSQL."
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+async def test_new_fronted_condition_resets_preceding_governed_action_boundary(kind):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(kind=kind, text="Use Redis."),
+                        candidate(text="Use PostgreSQL."),
+                    ]
+                }
+            )
+        )
+    )
+    evidence = (
+        "We selected PostgreSQL. If the benchmark succeeds, we will use PostgreSQL "
+        "and if throughput improves but latency remains high, we will use Redis."
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+CONTRACTIONS = [
+    ("isn't used", "is not used", "is used"),
+    ("aren't used", "are not used", "are used"),
+    ("wasn't used", "was not used", "was used"),
+    ("weren't used", "were not used", "were used"),
+    ("doesn't restart", "does not restart", "does restart"),
+    ("don't restart", "do not restart", "do restart"),
+    ("didn't restart", "did not restart", "did restart"),
+    ("can't be used", "can not be used", "can be used"),
+    ("won't be used", "will not be used", "will be used"),
+    ("hasn't been used", "has not been used", "has been used"),
+    ("haven't been used", "have not been used", "have been used"),
+    ("hadn't been used", "had not been used", "had been used"),
+    ("ISN’T used", "is not used", "is used"),
+]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(("contracted", "negative", "positive"), CONTRACTIONS)
+async def test_contracted_negation_never_supports_a_positive_fact(
+    kind, contracted, negative, positive
+):
+    text = f"Redis {positive} for caching."
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {"memories": [candidate(kind=kind, text=text), candidate(text="Use PostgreSQL.")]}
+            )
+        )
+    )
+    assert await instance.extract(
+        source(f"We selected PostgreSQL. Redis {contracted} for caching.")
+    ) == [MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(("contracted", "negative", "positive"), CONTRACTIONS)
+@pytest.mark.parametrize("contract_candidate", [False, True])
+async def test_contracted_and_explicit_negative_facts_preserve_polarity(
+    kind, contracted, negative, positive, contract_candidate
+):
+    text = f"Redis {contracted if contract_candidate else negative} for caching."
+    evidence = f"Redis {negative if contract_candidate else contracted} for caching."
+    instance = curator(
+        lambda request: response(json.dumps({"memories": [candidate(kind=kind, text=text)]}))
+    )
+    assert await instance.extract(source(evidence)) == [MemoryDraft(kind, text, 0.9, 0.8)]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(("contracted", "negative", "positive"), CONTRACTIONS)
+async def test_positive_evidence_never_supports_a_contracted_negative_fact(
+    kind, contracted, negative, positive
+):
+    text = f"Redis {contracted} for caching."
+    instance = curator(
+        lambda request: response(json.dumps({"memories": [candidate(kind=kind, text=text)]}))
+    )
+    assert await instance.extract(source(f"Redis {positive} for caching.")) == []

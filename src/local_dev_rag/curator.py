@@ -106,7 +106,7 @@ def _object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _terms(text: str) -> set[str]:
-    return set(re.findall(r"[\w-]+", text.casefold())) - {
+    return set(re.findall(r"[\w-]+", _normalize_negation(text).casefold())) - {
         "content",
         "role",
         "assistant",
@@ -152,9 +152,7 @@ def _evidence_clauses(statement: str) -> list[str]:
     """Keep a nominal list and its qualifiers under one governing predicate."""
     # An incidental comma after a conjunction does not attach its following
     # condition to the preceding assertion ("PostgreSQL and, if ..., Redis").
-    statement = re.sub(
-        r"\b(and|but|while|whereas|however)\s*,\s*", r"\1 ", statement, flags=re.I
-    )
+    statement = re.sub(r"\b(and|but|while|whereas|however)\s*,\s*", r"\1 ", statement, flags=re.I)
     parts = _CLAUSES.split(statement)
     clauses: list[str] = []
     current = parts[0]
@@ -234,12 +232,50 @@ def _clause_evidence(
     return inherited, _nominal_terms(clause) if inherited else set()
 
 
+def _normalize_negation(text: str) -> str:
+    """Retain explicit English contraction polarity before any token/grammar matching."""
+
+    def expand(match: re.Match[str]) -> str:
+        stem = match[1].casefold()
+        return {"ca": "can", "wo": "will", "sha": "shall"}.get(stem, stem) + " not"
+
+    return re.sub(
+        r"\b(is|are|was|were|does|do|did|has|have|had|ca|could|wo|would|should|must|need|sha)n['’]t\b",
+        expand,
+        text,
+        flags=re.I,
+    )
+
+
 def _fact_terms(text: str) -> set[str]:
     """Literal fact coverage keeps action/negation terms that option parsing omits."""
-    return set(re.findall(r"[\w-]+", text.casefold())) - {
-        "i", "we", "they", "it", "the", "a", "an", "is", "was", "are", "were",
-        "be", "been", "being", "has", "have", "had", "to", "of", "for", "in", "on",
-        "and", "as", "that", "which",
+    return set(re.findall(r"[\w-]+", _normalize_negation(text).casefold())) - {
+        "i",
+        "we",
+        "they",
+        "it",
+        "the",
+        "a",
+        "an",
+        "is",
+        "was",
+        "are",
+        "were",
+        "be",
+        "been",
+        "being",
+        "has",
+        "have",
+        "had",
+        "to",
+        "of",
+        "for",
+        "in",
+        "on",
+        "and",
+        "as",
+        "that",
+        "which",
     }
 
 
@@ -249,10 +285,11 @@ def _option_evidence(
     states: dict[str, Polarity] = {}
     facts: list[set[str]] = []
     for record in records:
-        excerpt = _excerpt_text(cast(str, record["excerpt"]))
+        excerpt = _normalize_negation(_excerpt_text(cast(str, record["excerpt"])))
         for statement in re.split(r"[.!?;\n]", excerpt):
             decision_frame = False
             conditional = False
+            condition_governed = False
             inherited: Polarity | None = None
             previous: set[str] = set()
             for clause in _evidence_clauses(statement):
@@ -264,11 +301,19 @@ def _option_evidence(
                     if connector not in {"and", ","}:
                         inherited = None
                         decision_frame = False
-                        if connector != "while":
+                        if not conditional or condition_governed:
                             conditional = False
+                            condition_governed = False
                     continue
                 status, subjects = _clause_evidence(clause, inherited, previous, decision_frame)
-                conditional = conditional or bool(_CONDITION.search(clause))
+                if _CONDITION.search(clause):
+                    conditional = True
+                    condition_governed = False
+                # Nested connectors belong to the condition until a supported
+                # action consumes it. A later independently governed sibling may
+                # then start its own scope, including after "while" or "but".
+                if conditional and subjects and status in {"selected", "rejected"}:
+                    condition_governed = True
                 uncertain = bool(
                     conditional or _SPECULATIVE.search(clause) or _UNCERTAIN.search(clause)
                 )
@@ -492,8 +537,7 @@ class Curator:
             ) or (
                 bool(candidate_facts)
                 and any(
-                    candidate_facts <= fact
-                    and candidate_facts & negation == fact & negation
+                    candidate_facts <= fact and candidate_facts & negation == fact & negation
                     for fact in fact_terms
                 )
             )

@@ -408,3 +408,120 @@ async def test_worker_never_revives_retired_memories_on_retry(database, chroma_u
     assert result.state == "completed" and result.memory_count == 0
     assert len(await memories(database)) == 5
     assert await store.query(scope.project_id, (1, 0), 10) == []
+
+
+@pytest.mark.parametrize("state", ["deleted", "rejected", "superseded"])
+async def test_retired_early_batch_memory_is_not_recalled_after_partial_success_and_retry(
+    database, chroma_url, state
+):
+    from sqlalchemy import update
+
+    from local_dev_rag.api import create_app
+    from local_dev_rag.schema import conversation_events
+
+    from .test_foreground_flow import RESULT, deliver
+
+    scope, job = await seed(database)
+    store = vector_store(chroma_url)
+    fail = True
+    batches = 0
+
+    def handler(request):
+        nonlocal batches
+        if request.url.path == "/api/embed":
+            batches += 1
+            if fail and batches == 2:
+                return httpx.Response(503)
+            size = len(json.loads(request.content)["input"])
+            return httpx.Response(200, json={"embeddings": [[1, 0]] * size})
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {
+                                    "memories": [
+                                        {
+                                            "kind": "decision",
+                                            "text": f"PostgreSQL {text} successfully.",
+                                            "confidence": 0.9,
+                                            "importance": 0.8,
+                                        }
+                                        for text in [
+                                            "started",
+                                            "restarted",
+                                            "recovered",
+                                            "connected",
+                                            "migrated",
+                                        ]
+                                    ]
+                                }
+                            ),
+                        },
+                    }
+                ]
+            },
+        )
+
+    # Distinct fact bodies prove which exact vector is eligible in the actual prompt.
+    async with database.session() as session:
+        await session.execute(
+            update(conversation_events)
+            .where(conversation_events.c.id == job.source_event_id)
+            .values(
+                payload={
+                    "content": " ".join(
+                        f"PostgreSQL {text} successfully."
+                        for text in ["started", "restarted", "recovered", "connected", "migrated"]
+                    )
+                }
+            )
+        )
+    assert (await worker(database, store, handler).run_once()).state == "retry"
+    early_hits = await store.query(scope.project_id, (1, 0), 10)
+    assert len(early_hits) == 2
+    retired = early_hits[0].memory
+    replacement = early_hits[1].memory
+    async with database.session() as session:
+        await session.execute(
+            update(memory_items)
+            .where(memory_items.c.id == retired.id)
+            .values(
+                state=state,
+                superseded_by_id=replacement.id if state == "superseded" else None,
+            )
+        )
+    await ready(database, job.id)
+    fail = False
+    assert (await worker(database, store, handler).run_once()).state == "completed"
+
+    observed = []
+
+    def foreground(request):
+        body = json.loads(request.content)
+        if request.url.path == "/api/embed":
+            return httpx.Response(200, json={"embeddings": [[1, 0]]})
+        observed.append(body)
+        return httpx.Response(200, json=RESULT)
+
+    settings = Settings(_env_file=None, retrieval_result_limit=10, retrieval_min_score=0)
+    app = create_app(
+        settings,
+        database=database,
+        vector_store=store,
+        ollama_client=OllamaClient(settings, transport=httpx.MockTransport(foreground)),
+    )
+    query = {
+        "model": "qwen3-coder:30b",
+        "messages": [{"role": "user", "content": "Recall PostgreSQL successfully."}],
+    }
+    body, diagnostics = await deliver(app, query)
+    assert json.loads(body) == RESULT
+    prompt = json.dumps(observed[0]["messages"])
+    assert retired.text not in prompt
+    assert replacement.text in prompt
+    assert diagnostics["proxy_diagnostics"].retrieval_count == 4

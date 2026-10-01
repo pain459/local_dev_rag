@@ -3,7 +3,7 @@
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Protocol, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, update
@@ -23,6 +23,7 @@ from local_dev_rag.domain import (
     RequestIdentity,
     Scope,
     StoredEvent,
+    VectorHit,
 )
 from local_dev_rag.events import content_hash
 from local_dev_rag.schema import conversation_events, memory_items, memory_jobs, projects, sessions
@@ -133,6 +134,27 @@ class MemoryRepository:
             .all()
         )
         return [MemoryItem(**dict(row)) for row in rows]
+
+    async def resolve_hits(self, project_id: UUID, hits: Sequence[VectorHit]) -> list[VectorHit]:
+        rows = (
+            (
+                await self.session.execute(
+                    select(memory_items).where(
+                        memory_items.c.project_id == project_id,
+                        memory_items.c.id.in_([hit.memory.id for hit in hits]),
+                        memory_items.c.state == "active",
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+        current = {row["id"]: MemoryItem(**dict(row)) for row in rows}
+        return [
+            VectorHit(current[hit.memory.id], hit.distance)
+            for hit in hits
+            if hit.memory.id in current
+        ]
 
     async def record_embedding(
         self, project_id: UUID, ids: Sequence[UUID], model: str, version: int
@@ -476,6 +498,29 @@ class CaptureAttempt:
 
 class CaptureUnavailable(RuntimeError):
     """The inbound history could not be made durable."""
+
+
+class VectorQuery(Protocol):
+    async def query(
+        self, project_id: UUID, vector: Sequence[float], limit: int
+    ) -> list[VectorHit]: ...
+
+
+class PostgresMemorySearch:
+    """Chroma supplies distances; PostgreSQL supplies eligible memory records."""
+
+    def __init__(self, database: Database, search: VectorQuery):
+        self.database, self.search = database, search
+
+    async def query(self, project_id: UUID, vector: Sequence[float], limit: int) -> list[VectorHit]:
+        hits = await self.search.query(project_id, vector, limit)
+        if not hits:
+            return []
+        try:
+            async with self.database.session() as session:
+                return await MemoryRepository(session).resolve_hits(project_id, hits)
+        except (SQLAlchemyError, OSError) as error:
+            raise CaptureUnavailable("Authoritative memory unavailable") from error
 
 
 class PostgresCaptureStore:

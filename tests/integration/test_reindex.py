@@ -6,6 +6,7 @@ import os
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -263,3 +264,34 @@ async def test_new_embedding_version_can_rebuild_with_a_different_vector_dimensi
     assert {hit.memory.id for hit in hits} == {hit.memory.id for hit in old_hits}
     assert all(hit.memory.embedding_version == 2 for hit in hits)
     assert len(await old_store.query(foreign.project_id, (1, 0), 10)) == 5
+
+
+async def test_completed_worker_during_reindex_deletion_remains_indexed(database, chroma_url):
+    from local_dev_rag.vector_store import VectorStore
+
+    from .test_jobs import row
+
+    module = cli()
+    scope, job = await seed(database)
+
+    class InterleavedStore(VectorStore):
+        async def delete_project(self, project_id):
+            # The worker completes after reindex begins, immediately before deletion.
+            result = await worker(database, self, handler).run_once()
+            assert result.state == "completed" and result.memory_count == 5
+            await super().delete_project(project_id)
+
+    settings = Settings(_env_file=None, chromadb_url=chroma_url, embedding_version=3)
+    store = InterleavedStore(settings, collection_name=f"reindex-race-{uuid4()}")
+    await module.reindex(
+        database,
+        settings,
+        "project",
+        vector_store=store,
+        embedder=OllamaClient(settings, transport=httpx.MockTransport(handler)),
+        batch_size=2,
+    )
+    assert (await row(database, job.id))["status"] == "completed"
+    ids = {item["id"] for item in await memories(database)}
+    assert len(ids) == 5
+    assert {hit.memory.id for hit in await store.query(scope.project_id, (1, 0), 10)} == ids
