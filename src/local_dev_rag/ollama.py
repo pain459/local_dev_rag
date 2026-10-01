@@ -1,11 +1,12 @@
 """Ollama transport adapter; chat uses its OpenAI compatibility endpoint."""
 
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from math import isfinite
 from typing import cast
 
 import httpx
+from anyio import CancelScope
 
 from local_dev_rag.config import Settings
 from local_dev_rag.domain import DependencyStatus, UpstreamResponse
@@ -42,8 +43,17 @@ class OllamaClient:
                 yield UpstreamResponse(response.status_code, dict(response.headers), body())
 
     async def embed(self, model: str, inputs: Sequence[str]) -> list[list[float]]:
-        async with self._client() as client:
-            response = await client.post("/api/embed", json={"model": model, "input": list(inputs)})
+        stack = AsyncExitStack()
+        try:
+            client = await stack.enter_async_context(self._client())
+            response = await stack.enter_async_context(
+                client.stream(
+                    "POST",
+                    "/api/embed",
+                    json={"model": model, "input": list(inputs)},
+                )
+            )
+            await response.aread()
             response.raise_for_status()
             payload = cast(dict[str, object], response.json())
             vectors = payload.get("embeddings")
@@ -63,6 +73,9 @@ class OllamaClient:
                     raise ValueError("Ollama returned an invalid embedding value")
                 result.append([float(cast(float, value)) for value in values])
             return result
+        finally:
+            with CancelScope(shield=True):
+                await stack.aclose()
 
     async def health(self) -> DependencyStatus:
         try:

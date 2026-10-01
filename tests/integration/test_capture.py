@@ -32,10 +32,17 @@ SSE = (
 
 def capture_app(database, handler):
     settings = Settings(_env_file=None)
+
+    async def route(request):
+        if request.url.path == "/api/embed":
+            return httpx.Response(503, json={"error": "embedder unavailable in capture fixture"})
+        result = handler(request)
+        return await result if hasattr(result, "__await__") else result
+
     app = create_app(
         settings,
         database=database,
-        ollama_client=OllamaClient(settings, transport=httpx.MockTransport(handler)),
+        ollama_client=OllamaClient(settings, transport=httpx.MockTransport(route)),
     )
     return app
 

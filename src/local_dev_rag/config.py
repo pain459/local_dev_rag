@@ -34,6 +34,21 @@ def _default_budgets() -> dict[str, ModelBudget]:
     }
 
 
+class RankingWeights(BaseModel):
+    semantic: float = Field(default=0.55, ge=0, le=1)
+    importance: float = Field(default=0.15, ge=0, le=1)
+    recency: float = Field(default=0.1, ge=0, le=1)
+    overlap: float = Field(default=0.15, ge=0, le=1)
+    diversity: float = Field(default=0.05, ge=0, le=1)
+    recency_half_life_days: float = Field(default=30, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def validate_weights(self) -> Self:
+        if not self.semantic + self.importance + self.recency + self.overlap + self.diversity:
+            raise ValueError("At least one ranking weight must be positive")
+        return self
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -55,6 +70,7 @@ class Settings(BaseSettings):
     retrieval_candidate_limit: int = Field(default=20, gt=0)
     retrieval_result_limit: int = Field(default=6, gt=0)
     retrieval_min_score: float = Field(default=0.35, ge=0, le=1)
+    ranking_weights: RankingWeights = Field(default_factory=RankingWeights)
     retry_max_attempts: int = Field(default=5, gt=0)
     retry_initial_seconds: float = Field(default=2, gt=0)
     retry_max_seconds: float = Field(default=300, gt=0)

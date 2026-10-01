@@ -6,12 +6,53 @@ import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 
+import httpx
 import pytest
 from sqlalchemy import text
 
 from local_dev_rag.config import Settings
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(scope="session")
+def chroma_url() -> Iterator[str]:
+    container = subprocess.check_output(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-d",
+            "-p",
+            "127.0.0.1::8000",
+            "-e",
+            "ANONYMIZED_TELEMETRY=FALSE",
+            "chromadb/chroma:0.6.3",
+        ],
+        text=True,
+    ).strip()
+    try:
+        port = (
+            subprocess.check_output(
+                ["docker", "port", container, "8000/tcp"],
+                text=True,
+            )
+            .strip()
+            .rsplit(":", 1)[1]
+        )
+        url = f"http://127.0.0.1:{port}"
+        for _ in range(120):
+            try:
+                if httpx.get(f"{url}/api/v1/heartbeat", timeout=1).status_code == 200:
+                    break
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.25)
+        else:
+            pytest.fail("Temporary ChromaDB did not become ready")
+        yield url
+    finally:
+        subprocess.run(["docker", "stop", container], check=True, capture_output=True)
 
 
 @pytest.fixture(scope="session")

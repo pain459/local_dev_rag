@@ -1,14 +1,18 @@
 """Transaction-bound, retry-safe PostgreSQL conversation persistence."""
 
+import logging
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from typing import cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import RowMapping
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from local_dev_rag.db import Database
 from local_dev_rag.domain import (
     AssistantCompletion,
     ConversationEventInput,
@@ -17,7 +21,10 @@ from local_dev_rag.domain import (
     Scope,
     StoredEvent,
 )
+from local_dev_rag.events import content_hash
 from local_dev_rag.schema import conversation_events, memory_jobs, projects, sessions
+
+logger = logging.getLogger(__name__)
 
 
 def _json_value(value: object) -> object:
@@ -251,3 +258,88 @@ class ConversationRepository:
                 .one()
             )
         return _memory_job(row)
+
+
+@dataclass
+class CaptureAttempt:
+    database: Database
+    scope: Scope
+    request_id: str
+    parent_hash: str
+    model: str
+    status: str = "inbound_persisted"
+    finished: bool = False
+
+    async def finish(self, completion: AssistantCompletion | None) -> None:
+        if self.finished:
+            return
+        try:
+            async with self.database.session() as session:
+                repository = ConversationRepository(session)
+                if completion is not None:
+                    event = ConversationEventInput(
+                        event_type="message",
+                        role="assistant",
+                        payload=completion.payload,
+                        content_hash="",
+                        request_id=self.request_id,
+                        parent_hash=self.parent_hash,
+                    )
+                    await repository.finalize_assistant(
+                        self.scope,
+                        replace(
+                            completion,
+                            content_hash=content_hash(event),
+                            request_id=self.request_id,
+                        ),
+                    )
+                else:
+                    attempt_id = str(uuid4())
+                    await repository.append_events(
+                        self.scope,
+                        [
+                            ConversationEventInput(
+                                event_type="attempt",
+                                role="proxy",
+                                payload={"status": "incomplete", "attempt_id": attempt_id},
+                                content_hash=f"attempt:{attempt_id}",
+                                request_id=self.request_id,
+                                model=self.model,
+                                completed=False,
+                            )
+                        ],
+                    )
+            self.status = "completed" if completion else "incomplete"
+        except (SQLAlchemyError, OSError):
+            self.status = "unavailable"
+            logger.warning("Conversation capture unavailable; completion was not persisted")
+        self.finished = True
+
+
+class CaptureUnavailable(RuntimeError):
+    """The inbound history could not be made durable."""
+
+
+class PostgresCaptureStore:
+    def __init__(self, database: Database):
+        self.database = database
+
+    async def begin(
+        self,
+        identity: RequestIdentity,
+        events: Sequence[ConversationEventInput],
+        model: str,
+        request_id: str,
+        parent_hash: str,
+    ) -> CaptureAttempt:
+        try:
+            async with self.database.session() as session:
+                repository = ConversationRepository(session)
+                scope = await repository.ensure_scope(identity)
+                await repository.append_events(
+                    scope,
+                    [replace(event, request_id=request_id, model=model) for event in events],
+                )
+            return CaptureAttempt(self.database, scope, request_id, parent_hash, model)
+        except (SQLAlchemyError, OSError) as error:
+            raise CaptureUnavailable("PostgreSQL capture unavailable") from error
