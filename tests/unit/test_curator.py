@@ -522,3 +522,131 @@ async def test_unknown_or_ambiguous_selection_cannot_support_an_invented_decisio
         )
     )
     assert await instance.extract(source(evidence)) == []
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "We decided to evaluate Redis for durable memory.",
+        "We decided to benchmark Redis for durable memory.",
+        "We agreed to investigate Redis for durable memory.",
+        "We must evaluate Redis for durable memory.",
+        "We may have selected Redis for durable memory.",
+        "We probably selected Redis for durable memory.",
+        "We would have selected Redis for durable memory.",
+        "We will use either Redis or PostgreSQL for durable memory.",
+        "We will use Redis or PostgreSQL for durable memory.",
+        "We will use Redis, PostgreSQL or MongoDB for durable memory.",
+        "We will use Redis, PostgreSQL, or MongoDB for durable memory.",
+        "We selected Redis, if the benchmark succeeds.",
+        "We decided to use Redis if the benchmark succeeds.",
+        "We decided to evaluate MongoDB and use Redis for durable memory.",
+        "We may have selected MongoDB and use Redis for durable memory.",
+    ],
+)
+async def test_uncertain_or_exploratory_actions_cannot_affirm_option_subjects(evidence):
+    instance = curator(
+        lambda request: response(json.dumps({"memories": [candidate(text="Use Redis.")]}))
+    )
+    assert await instance.extract(source(evidence)) == []
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "We decided to evaluate Redis for durable memory.",
+        "We may have selected Redis for durable memory.",
+        "We will use either Redis or MongoDB for durable memory.",
+    ],
+)
+@pytest.mark.parametrize("confirmed_first", [False, True])
+async def test_ambiguous_option_does_not_suppress_an_independent_confirmation(
+    evidence, confirmed_first
+):
+    confirmed = "We decided to use PostgreSQL for durable memory."
+    content = f"{confirmed} {evidence}" if confirmed_first else f"{evidence} {confirmed}"
+    instance = curator(
+        lambda request: response(
+            json.dumps({"memories": [candidate(text="Use Redis."), candidate()]})
+        )
+    )
+    assert await instance.extract(source(content)) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Redis will replace PostgreSQL for durable memory.",
+        "Redis and PostgreSQL will be used for durable memory.",
+        "We selected PostgreSQL and Redis for durable memory.",
+        "For durable memory, Redis replaces PostgreSQL.",
+        "PostgreSQL is selected alongside Redis for durable memory.",
+        "PostgreSQL will be replaced by Redis for durable memory.",
+        "PostgreSQL is the database and Redis is the cache.",
+        "PostgreSQL and Redis for durable memory.",
+        "Use PostgreSQL with Redis for durable memory.",
+    ],
+)
+async def test_every_decision_draft_requires_evidence_for_all_option_subjects(text):
+    instance = curator(
+        lambda request: response(json.dumps({"memories": [candidate(text=text), candidate()]}))
+    )
+    assert await instance.extract(source()) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+async def test_declarative_decision_subject_checks_do_not_depend_on_model_kind(kind):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(
+                            kind=kind,
+                            text="Redis will replace PostgreSQL for durable memory.",
+                        ),
+                        candidate(),
+                    ]
+                }
+            )
+        )
+    )
+    assert await instance.extract(source()) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "PostgreSQL was selected for durable memory.",
+        "We chose PostgreSQL for durable memory.",
+        "PostgreSQL will be used for durable memory.",
+        "Durable memory will use PostgreSQL.",
+        "PostgreSQL is the selected durable memory store.",
+        "Choose PostgreSQL for durable memory.",
+    ],
+)
+async def test_confirmed_subjects_allow_bounded_declarative_paraphrases(text):
+    instance = curator(lambda request: response(json.dumps({"memories": [candidate(text=text)]})))
+    assert await instance.extract(source()) == [MemoryDraft("decision", text, 0.9, 0.8)]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "We selected PostgreSQL and may have selected Redis for durable memory.",
+        "We will use PostgreSQL and will use either Redis or MongoDB for caching.",
+        "We decided to evaluate Redis and will use PostgreSQL for durable memory.",
+        "We selected PostgreSQL, Redis and MongoDB for durable memory.",
+    ],
+)
+async def test_an_independent_confirmed_clause_or_selected_list_remains_usable(evidence):
+    instance = curator(lambda request: response(json.dumps({"memories": [candidate()]})))
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]

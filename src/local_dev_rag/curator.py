@@ -26,19 +26,46 @@ _FILLER = re.compile(
 _PREDICATE = re.compile(
     r"\b(?:(?P<rejected>not\s+(?:to\s+)?(?:use|select(?:ed)?|choose|chosen)"
     r"|didn['’]t\s+(?:use|select|choose)|decided\s+against|rejected|ruled\s+out|declined|avoid)"
-    r"|(?P<selected>decided\s+to(?:\s+use)?|selected|chose|chosen|confirmed"
-    r"|agreed\s+to(?:\s+use)?|will\s+use|must(?:\s+use)?|required|fixed|completed)"
+    r"|(?P<selected>(?:decided|agreed)\s+to\s+(?:use|adopt|select|choose)"
+    r"|selected|chose|chosen|confirmed|will\s+use|must\s+use)"
     r"|(?P<unselected>evaluated|available|considered|investigated))\b",
     re.I,
 )
 _UNRESOLVED = re.compile(
-    r"\b(neither|whether|never|haven['’]t|hasn['’]t|didn['’]t|did\s+not)\b", re.I
+    r"\b(either|or|neither|whether|if|unless|never|haven['’]t|hasn['’]t|didn['’]t|did\s+not)\b",
+    re.I,
 )
 _CLAUSES = re.compile(r"(\b(?:and|but|while|whereas|however|instead\s+of|rather\s+than)\b|,)", re.I)
 _CONTEXT = re.compile(r"\b(?:for|because|since|when|with|as|which|that)\b", re.I)
-_COMMAND = re.compile(r"^(?:use|choose|select|adopt|prefer|require)\s+(.+)", re.I)
 _FRAME = re.compile(r"\b(decided|selected|chose|agreed)\b", re.I)
-_NOMINAL = re.compile(r"[\w.-]+(?:\s+[\w.-]+){0,3}")
+# Affirmations use a closed grammar: unknown modifiers/actions cannot grant selection.
+# In particular, a modal prefix cannot be discarded just because a later verb matches.
+_ACTIVE_PREFIX = re.compile(
+    r"\s*(?:(?:we|i|they|the team|the project)\s+)?"
+    r"(?:(?:have|has|had)\s+)?(?:(?:later|then)\s+)?",
+    re.I,
+)
+_PASSIVE_PREFIX = re.compile(
+    r"\s*([\w.-]+)\s+(?:is|was|were|are|has been|have been)\s+(?:only\s+)?", re.I
+)
+_NOMINAL = re.compile(r"[\w.-]+")
+_DECISION_LIKE = re.compile(
+    r"\b(?:decid(?:e[ds]?|ing)|decision|select(?:ed)?|cho(?:ose|se|sen)|confirm(?:ed)?"
+    r"|agree(?:d)?|will|must|shall|uses?|adopt(?:ed)?|prefer(?:red)?|require[sd]?"
+    r"|replac(?:e[sd]?|ing))\b",
+    re.I,
+)
+# A bounded paraphrase vocabulary, never a list of known technologies. Every other
+# content term is an option/subject and must be affirmatively supported, wherever
+# it occurs in a draft. Unknown wording fails closed instead of trusting overlap.
+_DECISION_LANGUAGE = frozenset(
+    "i they team project have has had later then be been being will must shall "
+    "decide decided decision select selected choose chose chosen confirm confirmed "
+    "agree agreed use uses used adopt adopted prefer preferred require requires required "
+    "replace replaces replaced replacing by with alongside instead rather than "
+    "as which that because since when durable memory store storage database backend "
+    "cache caching option best available".split()
+)
 Polarity = Literal["selected", "unselected", "rejected"]
 _SECRET = re.compile(
     r"(?:\b(?:api[ _-]?key|(?:access|refresh|auth)[ _-]?token|(?:client[ _-]?)?secret"
@@ -108,9 +135,31 @@ def _terms(text: str) -> set[str]:
 
 
 def _nominal_terms(text: str) -> set[str]:
-    """Only a bounded nominal subject is eligible, never its trailing rationale."""
+    """Only identifier lists are eligible, never unknown verbs or alternatives."""
     subject = _CONTEXT.split(text, maxsplit=1)[0].strip(" \t\"'{}:")
-    return _terms(subject) if _NOMINAL.fullmatch(subject) else set()
+    options = re.split(r"\s*(?:,\s*(?:and\s+)?|\band\b)\s*", subject)
+    return _terms(subject) if all(_NOMINAL.fullmatch(option) for option in options) else set()
+
+
+def _evidence_clauses(statement: str) -> list[str]:
+    """Keep a nominal list and its qualifiers under one governing predicate."""
+    parts = _CLAUSES.split(statement)
+    clauses: list[str] = []
+    current = parts[0]
+    for index in range(1, len(parts), 2):
+        connector, following = parts[index : index + 2]
+        # Only a new predicate or explicit negation/infinitive opens a clause.
+        # Thus "Redis, PostgreSQL, or MongoDB" is checked as one uncertain list.
+        independent = _PREDICATE.search(following) or re.match(
+            r"^\s*(?:not|neither|(?:to\s+)?use)\b", following, re.I
+        )
+        if connector.casefold() in {"and", ","} and not independent:
+            current += " " + connector + " " + following
+        else:
+            clauses.extend((current, connector))
+            current = following
+    clauses.append(current)
+    return clauses
 
 
 def _excerpt_text(excerpt: str) -> str:
@@ -143,12 +192,13 @@ def _clause_evidence(
         )
         if status == "selected" and local_negative:
             status, tail = "rejected", local_negative[1]
-        passive = re.search(r"([\w.-]+)\s+(?:is|was|were|are|been)\s+(?:only\s+)?$", prefix, re.I)
+        passive = _PASSIVE_PREFIX.fullmatch(prefix)
         subjects = _terms(passive[1]) if passive else _nominal_terms(tail)
         if not subjects and tail.strip().casefold() in {"", "it", "them"}:
             subjects = previous
         if status == "selected" and (
-            _SPECULATIVE.search(clause)
+            (not passive and not _ACTIVE_PREFIX.fullmatch(prefix))
+            or _SPECULATIVE.search(clause)
             or _UNRESOLVED.search(clause)
             or re.search(r"\bnot\b", prefix, re.I)
         ):
@@ -177,13 +227,10 @@ def _option_evidence(
         excerpt = _excerpt_text(cast(str, record["excerpt"]))
         grounded.update(_terms(excerpt))
         for statement in re.split(r"[.!?;\n]", excerpt):
-            frame = _FRAME.search(statement)
-            decision_frame = frame is not None and not _UNRESOLVED.search(
-                statement[: frame.start()]
-            )
+            decision_frame = False
             inherited: Polarity | None = None
             previous: set[str] = set()
-            for clause in _CLAUSES.split(statement):
+            for clause in _evidence_clauses(statement):
                 connector = " ".join(clause.split()).casefold()
                 if connector in {"instead of", "rather than"}:
                     inherited = "rejected"
@@ -191,6 +238,7 @@ def _option_evidence(
                 if connector in {"and", ",", "but", "while", "whereas", "however"}:
                     if connector not in {"and", ","}:
                         inherited = None
+                        decision_frame = False
                     continue
                 status, subjects = _clause_evidence(clause, inherited, previous, decision_frame)
                 if status:
@@ -198,6 +246,13 @@ def _option_evidence(
                         # Availability after an explicit selection does not revoke it.
                         if status != "unselected" or states.get(subject) != "selected":
                             states[subject] = status
+                # Coordination can extend only a parsed, certain decision frame.
+                # A word such as "decided" inside exploratory prose grants nothing.
+                decision_frame = bool(
+                    subjects
+                    and status in {"selected", "rejected"}
+                    and (decision_frame or _FRAME.search(clause))
+                )
                 inherited, previous = status, subjects
     return (
         {term for term, state in states.items() if state == "selected"},
@@ -386,8 +441,8 @@ class Curator:
                 continue
             text = candidate.text.strip()
             terms = _terms(text)
-            command = _COMMAND.match(text)
-            command_subjects: set[str] = _nominal_terms(command[1]) if command else set()
+            decision_like = candidate.kind == "decision" or _DECISION_LIKE.search(text)
+            decision_subjects = terms - _DECISION_LANGUAGE
             key = (candidate.kind, " ".join(text.casefold().split()))
             if (
                 not text
@@ -398,10 +453,9 @@ class Curator:
                 or _FILLER.fullmatch(text)
                 or bool(terms & excluded_terms)
                 or not bool(terms & grounded_terms)
-                or (candidate.kind == "decision" and not bool(terms & selected_terms))
                 or (
-                    command is not None
-                    and (not command_subjects or not command_subjects <= selected_terms)
+                    decision_like
+                    and (not decision_subjects or not decision_subjects <= selected_terms)
                 )
                 or key in seen
             ):
