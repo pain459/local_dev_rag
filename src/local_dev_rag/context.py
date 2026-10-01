@@ -28,6 +28,14 @@ class _Unit:
     invalid: bool = False
 
 
+def _valid_function(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    function = cast(Mapping[str, object], value)
+    name = function.get("name")
+    return isinstance(name, str) and bool(name) and isinstance(function.get("arguments"), str)
+
+
 def _conversation_units(messages: Sequence[Mapping[str, object]]) -> list[_Unit]:
     """Merge turns spanned by tool dependencies, including interleaved result order."""
     units: list[_Unit] = []
@@ -46,17 +54,24 @@ def _conversation_units(messages: Sequence[Mapping[str, object]]) -> list[_Unit]
         role = cast(str, message["role"])
         if role == "assistant":
             calls = message.get("tool_calls")
-            if calls:
+            if calls is not None:
                 if not isinstance(calls, (list, tuple)):
                     invalid.add(index)
-                    continue
-                for value in cast(Sequence[object], calls):
+                declarations = (
+                    cast(Sequence[object], calls) if isinstance(calls, (list, tuple)) else ()
+                )
+                for value in declarations:
                     if not isinstance(value, Mapping):
                         invalid.add(index)
                         continue
                     call = cast(Mapping[str, object], value)
                     call_id = call.get("id")
-                    if not isinstance(call_id, str) or not call_id:
+                    if (
+                        not isinstance(call_id, str)
+                        or not call_id
+                        or call.get("type") != "function"
+                        or not _valid_function(call.get("function"))
+                    ):
                         invalid.add(index)
                         continue
                     key = ("tool", call_id)
@@ -64,11 +79,11 @@ def _conversation_units(messages: Sequence[Mapping[str, object]]) -> list[_Unit]
                         invalid.update((pending[key], index))
                     pending[key] = index
             legacy = message.get("function_call")
-            if legacy:
+            if legacy is not None:
                 function: Mapping[str, object] = (
                     cast(Mapping[str, object], legacy) if isinstance(legacy, Mapping) else {}
                 )
-                if not isinstance(function.get("name"), str):
+                if not _valid_function(function):
                     invalid.add(index)
                 else:
                     name = cast(str, function.get("name"))

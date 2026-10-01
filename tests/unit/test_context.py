@@ -369,3 +369,135 @@ def test_tool_definitions_consume_budget_while_remaining_verbatim():
     assert result.payload["messages"] == [messages[-1]]
     assert result.payload["tools"] == tools
     assert result.estimated_input_tokens <= 300
+
+
+@pytest.mark.parametrize(
+    "fields,result",
+    [
+        ({"tool_calls": 0}, None),
+        ({"tool_calls": {}}, None),
+        ({"tool_calls": False}, None),
+        ({"tool_calls": ""}, None),
+        ({"tool_calls": [{"id": "c"}]}, tool("t", "c")),
+        ({"tool_calls": [{"id": "c", "type": "function", "function": {}}]}, tool("t", "c")),
+        (
+            {
+                "tool_calls": [
+                    {
+                        "id": "c",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                        },
+                    }
+                ]
+            },
+            tool("t", "c"),
+        ),
+        (
+            {
+                "tool_calls": [
+                    {
+                        "id": "c",
+                        "type": "function",
+                        "function": {
+                            "name": "",
+                            "arguments": "{}",
+                        },
+                    }
+                ]
+            },
+            tool("t", "c"),
+        ),
+        (
+            {
+                "tool_calls": [
+                    {
+                        "id": "c",
+                        "type": "other",
+                        "function": {
+                            "name": "read",
+                            "arguments": "{}",
+                        },
+                    }
+                ]
+            },
+            tool("t", "c"),
+        ),
+        (
+            {
+                "tool_calls": [
+                    {
+                        "id": "c",
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": {},
+                        },
+                    }
+                ]
+            },
+            tool("t", "c"),
+        ),
+        ({"function_call": {}}, None),
+        ({"function_call": 0}, None),
+        (
+            {"function_call": {"name": "read"}},
+            {
+                "role": "function",
+                "name": "read",
+                "id": "t",
+                "content": "result",
+            },
+        ),
+    ],
+)
+@pytest.mark.parametrize("history_kind", ["protected", "nondurable", "old-durable"])
+def test_malformed_tool_declarations_never_bypass_chain_safety(fields, result, history_kind):
+    # Rejecting/dropping declarations must depend on shape, not their truthiness
+    # or whether a result happens to reuse an otherwise malformed declaration's ID.
+    messages = [message("user", "request", "u"), {"role": "assistant", "id": "a", **fields}]
+    if result is not None:
+        messages.append(result)
+    if history_kind != "protected":
+        messages.append(message("user", "now", "current"))
+    builder = ContextBuilder(model(), memory_token_budget=0)
+    if history_kind == "old-durable":
+        built = builder.build(request(messages), [], True)
+        assert built.payload["messages"] == [messages[-1]]
+    else:
+        with pytest.raises(InvalidRequestError, match="tool") as error:
+            builder.build(request(messages), [], history_kind == "protected")
+        assert error.value.param == "messages"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"tool_calls": None},
+        {"function_call": None},
+        {"tool_calls": None, "function_call": None},
+        {"tool_calls": []},
+    ],
+)
+@pytest.mark.parametrize("history_durable", [True, False])
+def test_absent_null_and_empty_call_lists_preserve_legitimate_assistant_messages(
+    fields,
+    history_durable,
+):
+    messages = [
+        message("user", "now", "u"),
+        {
+            "role": "assistant",
+            "content": "normal reply",
+            "id": "a",
+            **fields,
+        },
+    ]
+    result = ContextBuilder(model(), memory_token_budget=0).build(
+        request(messages),
+        [],
+        history_durable,
+    )
+    assert result.payload["messages"] == messages
