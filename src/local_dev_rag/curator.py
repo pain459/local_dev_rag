@@ -3,7 +3,7 @@
 import asyncio
 import json
 import re
-from typing import cast
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -23,20 +23,23 @@ _FILLER = re.compile(
     r"|thanks(?: for your help)?|thank you)[.!\s]*",
     re.I,
 )
-_CONFIRMED = re.compile(
-    r"\b(decided\s+to|selected|chose|chosen|confirmed|agreed\s+to|will\s+use"
-    r"|must|required|fixed|completed)\b",
+_PREDICATE = re.compile(
+    r"\b(?:(?P<rejected>not\s+(?:to\s+)?(?:use|select(?:ed)?|choose|chosen)"
+    r"|didn['’]t\s+(?:use|select|choose)|decided\s+against|rejected|ruled\s+out|declined|avoid)"
+    r"|(?P<selected>decided\s+to(?:\s+use)?|selected|chose|chosen|confirmed"
+    r"|agreed\s+to(?:\s+use)?|will\s+use|must(?:\s+use)?|required|fixed|completed)"
+    r"|(?P<unselected>evaluated|available|considered|investigated))\b",
     re.I,
 )
-_REJECTED = re.compile(
-    r"\b(not\s+(?:to\s+)?(?:use|select(?:ed)?|choose|chosen)"
-    r"|didn['’]t\s+(?:use|select|choose)|decided\s+against"
-    r"|reject(?:ed)?|ruled\s+out|declined|avoid)\b",
-    re.I,
+_UNRESOLVED = re.compile(
+    r"\b(neither|whether|never|haven['’]t|hasn['’]t|didn['’]t|did\s+not)\b", re.I
 )
-_MENTIONED = re.compile(
-    r"\b(available|evaluated|considered|investigated|option|alternative)\b", re.I
-)
+_CLAUSES = re.compile(r"(\b(?:and|but|while|whereas|however|instead\s+of|rather\s+than)\b|,)", re.I)
+_CONTEXT = re.compile(r"\b(?:for|because|since|when|with|as|which|that)\b", re.I)
+_COMMAND = re.compile(r"^(?:use|choose|select|adopt|prefer|require)\s+(.+)", re.I)
+_FRAME = re.compile(r"\b(decided|selected|chose|agreed)\b", re.I)
+_NOMINAL = re.compile(r"[\w.-]+(?:\s+[\w.-]+){0,3}")
+Polarity = Literal["selected", "unselected", "rejected"]
 _SECRET = re.compile(
     r"(?:\b(?:api[ _-]?key|(?:access|refresh|auth)[ _-]?token|(?:client[ _-]?)?secret"
     r"|password|passwd|credentials?)[\"']?\s*[:=]\s*[\"']?\S+"
@@ -104,26 +107,83 @@ def _terms(text: str) -> set[str]:
     }
 
 
-def _unselected_terms(records: list[dict[str, object]]) -> tuple[bool, set[str]]:
-    """Track selected, mentioned, speculative and rejected option subjects by clause.
+def _nominal_terms(text: str) -> set[str]:
+    """Only a bounded nominal subject is eligible, never its trailing rationale."""
+    subject = _CONTEXT.split(text, maxsplit=1)[0].strip(" \t\"'{}:")
+    return _terms(subject) if _NOMINAL.fullmatch(subject) else set()
 
-    This complements the prompt: a rewording without 'maybe' must not turn an
-    unselected alternative into a decision when a different decision is confirmed.
-    Context phrases are excluded from subject terms so a rejected option's rationale
-    cannot suppress a separate selected option with the same rationale.
-    """
-    selected: set[str] = set()
-    unselected: set[str] = set()
-    rejected: set[str] = set()
+
+def _excerpt_text(excerpt: str) -> str:
+    # Decode our own serialized content so escaped newlines remain clause boundaries.
+    try:
+        payload: object = json.loads(excerpt)
+    except ValueError:
+        return excerpt  # Bounded/truncated excerpts may no longer be complete inner JSON.
+    if isinstance(payload, dict):
+        content = cast(dict[str, object], payload).get("content")
+        if isinstance(content, str):
+            return content
+    return excerpt
+
+
+def _clause_evidence(
+    clause: str,
+    inherited: Polarity | None,
+    previous: set[str],
+    decision_frame: bool,
+) -> tuple[Polarity | None, set[str]]:
+    """Resolve a governing predicate first, then its subject and local modifiers."""
+    clause = clause.strip()
+    predicate = _PREDICATE.search(clause)
+    if predicate is not None:
+        status = cast(Polarity, predicate.lastgroup)
+        prefix, tail = clause[: predicate.start()], clause[predicate.end() :]
+        local_negative = re.match(
+            r"^\s*not\s+(?:to\s+)?(?:(?:use|select|choose)\s+)?(.+)", tail, re.I
+        )
+        if status == "selected" and local_negative:
+            status, tail = "rejected", local_negative[1]
+        passive = re.search(r"([\w.-]+)\s+(?:is|was|were|are|been)\s+(?:only\s+)?$", prefix, re.I)
+        subjects = _terms(passive[1]) if passive else _nominal_terms(tail)
+        if not subjects and tail.strip().casefold() in {"", "it", "them"}:
+            subjects = previous
+        if status == "selected" and (
+            _SPECULATIVE.search(clause)
+            or _UNRESOLVED.search(clause)
+            or re.search(r"\bnot\b", prefix, re.I)
+        ):
+            status = "unselected"
+        return status, subjects
+    # Coordinated infinitives belong to a decision frame but have their own negation.
+    infinitive = re.match(r"^(not\s+)?(?:to\s+)?use\s+(.+)", clause, re.I)
+    if infinitive and decision_frame:
+        return ("rejected" if infinitive[1] else "selected"), _nominal_terms(infinitive[2])
+    negative = re.match(r"^(?:not|neither)\s+(.+)", clause, re.I)
+    if negative:
+        return "rejected", _nominal_terms(negative[1])
+    command = re.search(r"\buse\s+(.+)", clause, re.I)
+    if command and _SPECULATIVE.search(clause):
+        return "unselected", _nominal_terms(command[1])
+    # Inherit only for a bare subject list, never an arbitrary clause with a new verb.
+    return inherited, _nominal_terms(clause) if inherited else set()
+
+
+def _option_evidence(
+    records: list[dict[str, object]],
+) -> tuple[set[str], set[str], set[str]]:
+    states: dict[str, Polarity] = {}
+    grounded: set[str] = set()
     for record in records:
-        for statement in re.split(r"[.!?;\n]", cast(str, record["excerpt"])):
-            inherited: str | None = None
-            # Coordination scopes each predicate independently. Only bare nominal
-            # lists joined by 'and'/commas can inherit the preceding predicate.
-            for clause in re.split(
-                r"(\b(?:and|but|while|whereas|however|instead\s+of|rather\s+than)\b|,)",
-                statement,
-            ):
+        excerpt = _excerpt_text(cast(str, record["excerpt"]))
+        grounded.update(_terms(excerpt))
+        for statement in re.split(r"[.!?;\n]", excerpt):
+            frame = _FRAME.search(statement)
+            decision_frame = frame is not None and not _UNRESOLVED.search(
+                statement[: frame.start()]
+            )
+            inherited: Polarity | None = None
+            previous: set[str] = set()
+            for clause in _CLAUSES.split(statement):
                 connector = " ".join(clause.split()).casefold()
                 if connector in {"instead of", "rather than"}:
                     inherited = "rejected"
@@ -132,55 +192,18 @@ def _unselected_terms(records: list[dict[str, object]]) -> tuple[bool, set[str]]
                     if connector not in {"and", ","}:
                         inherited = None
                     continue
-                subject = re.split(
-                    r"\b(for|because|since|when|with)\b", clause, maxsplit=1, flags=re.I
-                )[0]
-                terms = _terms(subject) - {
-                    "available",
-                    "evaluated",
-                    "considered",
-                    "investigated",
-                    "option",
-                    "alternative",
-                    "decided",
-                    "chose",
-                    "chosen",
-                    "will",
-                    "only",
-                    "later",
-                    "then",
-                    "rejected",
-                    "confirmed",
-                    "agreed",
-                    "fixed",
-                    "completed",
-                    "must",
-                    "required",
-                    "they",
-                    "i",
-                }
-                status: str | None = None
-                if _REJECTED.search(clause):
-                    status = "rejected"
-                elif _SPECULATIVE.search(clause) or _MENTIONED.search(clause):
-                    status = "unselected"
-                elif _CONFIRMED.search(clause):
-                    status = "selected"
-                elif inherited and re.fullmatch(
-                    r"[\w-]+(?:\s+[\w-]+){0,3}", subject.strip(" \t\"'{}:")
-                ):
-                    status = inherited
-                if status == "rejected":
-                    rejected.update(terms)
-                    selected.difference_update(terms)
-                elif status == "unselected":
-                    unselected.update(terms)
-                elif status == "selected":
-                    selected.update(terms)
-                    rejected.difference_update(terms)
-                inherited = status
-    excluded = (unselected | rejected) - selected
-    return bool(excluded) and not selected, excluded
+                status, subjects = _clause_evidence(clause, inherited, previous, decision_frame)
+                if status:
+                    for subject in subjects:
+                        # Availability after an explicit selection does not revoke it.
+                        if status != "unselected" or states.get(subject) != "selected":
+                            states[subject] = status
+                inherited, previous = status, subjects
+    return (
+        {term for term, state in states.items() if state == "selected"},
+        {term for term, state in states.items() if state != "selected"},
+        grounded,
+    )
 
 
 class Curator:
@@ -353,9 +376,7 @@ class Curator:
         if len(candidates) > self.max_memories:
             raise CuratorValidationError("Curator candidates exceed count budget")
         source_text = cast(str, cast(list[dict[str, object]], payload["messages"])[1]["content"])
-        unconfirmed, excluded_terms = _unselected_terms(json.loads(source_text))
-        if unconfirmed:
-            return []
+        selected_terms, excluded_terms, grounded_terms = _option_evidence(json.loads(source_text))
         drafts: list[MemoryDraft] = []
         seen: set[tuple[MemoryKind, str]] = set()
         for item in candidates:
@@ -364,6 +385,9 @@ class Curator:
             except ValidationError:
                 continue
             text = candidate.text.strip()
+            terms = _terms(text)
+            command = _COMMAND.match(text)
+            command_subjects: set[str] = _nominal_terms(command[1]) if command else set()
             key = (candidate.kind, " ".join(text.casefold().split()))
             if (
                 not text
@@ -372,7 +396,13 @@ class Curator:
                 or _SECRET.search(text)
                 or _SPECULATIVE.search(text)
                 or _FILLER.fullmatch(text)
-                or bool(_terms(text) & excluded_terms)
+                or bool(terms & excluded_terms)
+                or not bool(terms & grounded_terms)
+                or (candidate.kind == "decision" and not bool(terms & selected_terms))
+                or (
+                    command is not None
+                    and (not command_subjects or not command_subjects <= selected_terms)
+                )
                 or key in seen
             ):
                 continue

@@ -446,3 +446,79 @@ async def test_explicit_selection_is_preserved_across_mentions_and_selected_opti
     assert await instance.extract(source(evidence)) == [
         MemoryDraft("decision", "Use Redis.", 0.9, 0.8)
     ]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "For durable memory we evaluated Redis. We decided to use PostgreSQL for durable memory.",
+        "For durable memory, we evaluated Redis. We decided to use PostgreSQL for durable memory.",
+        "We will use PostgreSQL for durable memory, not Redis.",
+        "We decided not to use Redis and to use PostgreSQL for durable memory.",
+        "We decided not to use Redis and use PostgreSQL for durable memory.",
+        "We evaluated Redis and selected PostgreSQL as the best option for durable memory.",
+        "We selected PostgreSQL as the best option for durable memory and rejected Redis.",
+        "Redis was evaluated. "
+        "PostgreSQL was selected as the best available option for durable memory.",
+        "We must not use Redis and will use PostgreSQL for durable memory.",
+        "We decided to not use Redis and to use PostgreSQL for durable memory.",
+    ],
+)
+async def test_predicate_subject_scope_preserves_only_the_confirmed_sibling(evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [candidate(text="Use Redis."), candidate()],
+                }
+            )
+        )
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "Redis is available. We selected Redis as the best option.",
+        "We evaluated Redis. We selected Redis as the best available option.",
+        "We evaluated Redis and selected Redis as the best option.",
+    ],
+)
+async def test_explicit_predicate_restores_the_option_despite_neutral_descriptive_words(evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [candidate(text="Use Redis.")],
+                }
+            )
+        )
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use Redis.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "We decided to use PostgreSQL for durable memory.",  # Redis has no source evidence.
+        "We haven't decided to use Redis.",
+        "We selected neither Redis nor PostgreSQL.",
+        "We evaluated Redis and maybe selected Redis as an option.",
+    ],
+)
+async def test_unknown_or_ambiguous_selection_cannot_support_an_invented_decision(evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [candidate(text="Use Redis.")],
+                }
+            )
+        )
+    )
+    assert await instance.extract(source(evidence)) == []
