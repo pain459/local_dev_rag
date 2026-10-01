@@ -42,6 +42,10 @@ def rank_memories(
             continue
         age = max(0.0, (_utc(now) - _utc(hit.memory.created_at)).total_seconds() / 86400)
         tokens = _tokens(hit.memory.text)
+        # Orthogonal/unrelated memories cannot qualify through bonus factors alone.
+        # Exact identifier/error overlap remains useful when embeddings miss a match.
+        if not tokens & query_tokens and hit.distance > 1 - weights.min_semantic_similarity:
+            continue
         pending.append(
             (
                 hit,

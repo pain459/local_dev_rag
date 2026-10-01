@@ -55,7 +55,10 @@ class OllamaClient:
             )
             await response.aread()
             response.raise_for_status()
-            payload = cast(dict[str, object], response.json())
+            payload: object = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Ollama returned an invalid embedding response")
+            payload = cast(dict[str, object], payload)
             vectors = payload.get("embeddings")
             if not isinstance(vectors, list) or len(cast(list[object], vectors)) != len(inputs):
                 raise ValueError("Ollama returned an invalid embedding batch")

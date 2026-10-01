@@ -64,7 +64,9 @@ def test_cosine_components_are_hand_normalized_and_weights_are_configurable():
         "missing",
         [VectorHit(memory(importance=2), 1)],
         NOW,
-        weights=RankingWeights(semantic=1, importance=0, recency=0, overlap=0, diversity=0),
+        weights=RankingWeights(
+            semantic=1, importance=0, recency=0, overlap=0, diversity=0, min_semantic_similarity=0
+        ),
     )
     assert ranked[0].score == 0.5
     assert ranked[0].score_components == {
@@ -111,3 +113,56 @@ def test_future_dates_and_extreme_distances_stay_normalized():
     result = rank_memories("task", [VectorHit(memory(created_at=NOW + timedelta(days=1)), -2)], NOW)
     assert result[0].score_components["semantic"] == 1
     assert result[0].score_components["recency"] == 1
+
+
+def test_default_relevance_rejects_orthogonal_recent_important_cosmetic_memory():
+    from local_dev_rag.config import Settings
+    from local_dev_rag.ranking import rank_memories
+
+    config = Settings(_env_file=None)
+    cosmetic = memory(text="Prefer a blue sidebar", importance=1)
+    assert (
+        rank_memories(
+            "ECONNREFUSED load_widget",
+            [VectorHit(cosmetic, 1)],
+            NOW,
+            weights=config.ranking_weights,
+        )
+        == []
+    )
+
+
+def test_relevance_floor_can_be_tuned_independently_of_ranking_bonuses():
+    from local_dev_rag.config import RankingWeights
+    from local_dev_rag.ranking import rank_memories
+
+    cosmetic = VectorHit(memory(text="Prefer a blue sidebar", importance=1), 0.3)
+    assert (
+        rank_memories(
+            "ECONNREFUSED load_widget",
+            [cosmetic],
+            NOW,
+            weights=RankingWeights(min_semantic_similarity=0.8),
+        )
+        == []
+    )
+    assert (
+        len(
+            rank_memories(
+                "ECONNREFUSED load_widget",
+                [cosmetic],
+                NOW,
+                weights=RankingWeights(min_semantic_similarity=0.6),
+            )
+        )
+        == 1
+    )
+
+
+def test_exact_error_identifier_overlap_is_eligible_without_semantic_similarity():
+    from local_dev_rag.ranking import rank_memories
+
+    evidence = memory(text="load_widget: retry after ECONNREFUSED")
+    assert [
+        c.memory for c in rank_memories("ECONNREFUSED load_widget", [VectorHit(evidence, 1)], NOW)
+    ] == [evidence]

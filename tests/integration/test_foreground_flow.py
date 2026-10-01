@@ -380,3 +380,93 @@ async def test_cancelled_chroma_query_closes_transport_and_records_incomplete_at
         assert rows[-1]["role"] == "proxy"
         assert rows[-1]["completed"] is False
         assert (await session.execute(select(memory_jobs))).all() == []
+
+
+@pytest.mark.parametrize("floor", [None, 0], ids=["default-rejects", "explicitly-disabled"])
+async def test_default_relevance_excludes_orthogonal_cosmetic_memory(database, chroma_url, floor):
+    from local_dev_rag.vector_store import VectorStore
+
+    overrides = {} if floor is None else {"ranking_weights": {"min_semantic_similarity": floor}}
+    config = Settings(_env_file=None, chromadb_url=chroma_url, **overrides)
+    store = VectorStore(config, collection_name=f"default-relevance-{uuid4()}")
+    async with database.session() as session:
+        scope = await ConversationRepository(session).ensure_scope(
+            RequestIdentity("session", "project")
+        )
+    cosmetic = replace(memory(scope.project_id, "Prefer a blue sidebar"), importance=1)
+    await store.upsert([EmbeddedMemory(cosmetic, (0, 1))])
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == "/api/embed":
+            return httpx.Response(200, json={"embeddings": [[1, 0]]})
+        if floor is None:
+            assert "Prefer a blue sidebar" not in request.content.decode()
+        else:
+            assert "Prefer a blue sidebar" in request.content.decode()
+        return httpx.Response(200, json=RESULT)
+
+    app = create_app(
+        config,
+        database=database,
+        vector_store=store,
+        ollama_client=OllamaClient(config, transport=httpx.MockTransport(handler)),
+    )
+    request_payload = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "ECONNREFUSED load_widget"}],
+    }
+    body, state = await deliver(app, request_payload)
+    assert json.loads(body) == RESULT
+    assert state["proxy_diagnostics"].retrieval_count == (0 if floor is None else 1)
+    assert bool(state["proxy_diagnostics"].injected_memory_tokens) == (floor is not None)
+    assert state["proxy_diagnostics"].degraded_dependencies == ()
+    assert state["capture_status"] == "completed"
+    assert calls == ["/api/embed", "/v1/chat/completions"]
+
+
+@pytest.mark.parametrize("embedding_payload", [[], None, "invalid", 42])
+async def test_nonobject_embedding_json_uses_recent_context_and_preserves_capture(
+    database, embedding_payload
+):
+    from local_dev_rag.vector_store import VectorStore
+
+    config = settings()
+    calls = []
+
+    def ollama_handler(request):
+        calls.append(request.url.path)
+        if request.url.path == "/api/embed":
+            return httpx.Response(
+                200,
+                content=json.dumps(embedding_payload),
+                headers={"content-type": "application/json"},
+            )
+        outbound = json.loads(request.content)
+        assert outbound["messages"] == [payload()["messages"][0], payload()["messages"][-1]]
+        return httpx.Response(200, json=RESULT)
+
+    def chroma_handler(request):
+        pytest.fail("Malformed embedding JSON must never reach Chroma")
+
+    app = create_app(
+        config,
+        database=database,
+        vector_store=VectorStore(config, transport=httpx.MockTransport(chroma_handler)),
+        ollama_client=OllamaClient(config, transport=httpx.MockTransport(ollama_handler)),
+    )
+    body, state = await deliver(app, payload())
+    assert json.loads(body) == RESULT
+    assert state["proxy_diagnostics"].degraded_dependencies == ("embedder",)
+    assert state["proxy_diagnostics"].retrieval_count == 0
+    assert state["proxy_diagnostics"].injected_memory_tokens == 0
+    assert state["capture_status"] == "completed"
+    assert calls == ["/api/embed", "/v1/chat/completions"]
+    async with database.session() as session:
+        events = (await session.execute(select(conversation_events))).mappings().all()
+        assert len(events) == 5
+        assert events[1]["payload"]["content"] == "old " * 2000
+        assert events[-1]["role"] == "assistant"
+        assert events[-1]["completed"] is True
+        assert len((await session.execute(select(memory_jobs))).all()) == 1

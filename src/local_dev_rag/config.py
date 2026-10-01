@@ -41,6 +41,8 @@ class RankingWeights(BaseModel):
     overlap: float = Field(default=0.15, ge=0, le=1)
     diversity: float = Field(default=0.05, ge=0, le=1)
     recency_half_life_days: float = Field(default=30, gt=0, allow_inf_nan=False)
+    # Eligibility uses unshifted cosine similarity before importance/recency bonuses.
+    min_semantic_similarity: float = Field(default=0.2, ge=0, le=1)
 
     @model_validator(mode="after")
     def validate_weights(self) -> Self:
