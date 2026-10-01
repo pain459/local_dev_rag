@@ -1,5 +1,6 @@
 """Foreground orchestration with durable capture and optional project memory."""
 
+import asyncio
 import json
 import logging
 from collections.abc import (
@@ -20,6 +21,7 @@ from uuid import UUID
 import httpx
 from anyio import CancelScope
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.requests import ClientDisconnect
 from starlette.types import Message, Receive, Scope, Send
 
 from local_dev_rag.config import Settings
@@ -138,6 +140,15 @@ class UpstreamStreamingResponse(StreamingResponse):
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         delivered = False
+        disconnected = False
+        state = scope.setdefault("state", {})
+
+        async def observe_receive() -> Message:
+            nonlocal disconnected
+            message = await receive()
+            if message["type"] == "http.disconnect" and not delivered:
+                disconnected = True
+            return message
 
         async def observe_send(message: Message) -> None:
             nonlocal delivered
@@ -146,8 +157,16 @@ class UpstreamStreamingResponse(StreamingResponse):
                 delivered = True
 
         try:
-            await super().__call__(scope, receive, observe_send)
+            await super().__call__(scope, observe_receive, observe_send)
+        except (asyncio.CancelledError, ClientDisconnect):
+            state["stream_outcome"] = "cancelled"
+            raise
+        except BaseException:
+            state["stream_outcome"] = "upstream_error"
+            raise
         finally:
+            if disconnected:
+                state["stream_outcome"] = "cancelled"
             if not delivered:
                 self._accumulator.abort()
             with CancelScope(shield=True):
@@ -158,10 +177,19 @@ class UpstreamStreamingResponse(StreamingResponse):
                         await self._stack.aclose()
                 except BaseException:
                     self._accumulator.abort()
+                    if state.get("stream_outcome") != "cancelled":
+                        state["stream_outcome"] = "upstream_error"
                     raise
                 finally:
+                    completion = self._accumulator.completion()
+                    if "stream_outcome" not in state:
+                        state["stream_outcome"] = (
+                            "completed"
+                            if delivered and completion is not None
+                            else "upstream_error"
+                        )
                     if self._on_finished is not None:
-                        await self._on_finished(self._accumulator.completion())
+                        await self._on_finished(completion)
 
 
 def upstream_error(

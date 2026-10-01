@@ -1,5 +1,6 @@
 """Allowlisted JSON telemetry: arbitrary messages, payloads and tracebacks never serialize."""
 
+import asyncio
 import json
 import logging
 import re
@@ -10,12 +11,12 @@ from typing import cast
 from uuid import UUID, uuid4
 
 import httpx
+from starlette.requests import ClientDisconnect
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from local_dev_rag.config import Settings
 
 _context: ContextVar[dict[str, object] | None] = ContextVar("log_context", default=None)
-_identifier = re.compile(r"[A-Za-z0-9_-]{1,64}\Z", re.ASCII)
 _digest = re.compile(r"[0-9a-f]{24}\Z", re.ASCII)
 _events = {
     "request_completed",
@@ -43,10 +44,13 @@ def compact_id(value: str) -> str:
 
 
 def correlation_id(value: str | None) -> str:
-    return value if value is not None and _identifier.fullmatch(value) else str(uuid4())
+    # Header syntax cannot establish that an external value is free of sensitive content.
+    return compact_id(value) if value else str(uuid4())
 
 
 def error_category(error: BaseException) -> str:
+    if isinstance(error, (asyncio.CancelledError, ClientDisconnect)):
+        return "cancelled"
     if isinstance(error, (TimeoutError, httpx.TimeoutException)):
         return "timeout"
     if isinstance(error, httpx.HTTPError):
@@ -62,13 +66,20 @@ def _response_category(status: int) -> str | None:
 
 class SafeJSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
-        values: dict[str, object] = (_context.get() or {}) | record.__dict__
+        context = _context.get() or {}
+        values: dict[str, object] = context | record.__dict__
         event = record.msg if isinstance(record.msg, str) and record.msg in _events else "log"
         output: dict[str, object] = {"event": event, "level": record.levelname}
-        for key in ("request_id", "project_id", "session_id", "job_id"):
+        request_id = context.get("request_id")
+        if isinstance(request_id, str):
+            # Only the middleware's locally opaque correlation is trusted within a request.
+            output["request_id"] = request_id
+        elif isinstance(values.get("request_id"), str):
+            output["request_id"] = compact_id(cast(str, values["request_id"]))
+        for key in ("project_id", "session_id", "job_id"):
             value = values.get(key)
             if isinstance(value, str):
-                if key == "request_id" and _identifier.fullmatch(value) or _digest.fullmatch(value):
+                if _digest.fullmatch(value):
                     output[key] = value
                 else:
                     try:
@@ -108,6 +119,13 @@ class SafeJSONFormatter(logging.Formatter):
         )
         if record.exc_info and record.exc_info[1] is not None:
             output["error_category"] = error_category(record.exc_info[1])
+        for key, allowed in {
+            "stream_outcome": {"completed", "cancelled", "upstream_error"},
+            "capture_status": {"inbound_persisted", "completed", "incomplete", "unavailable"},
+        }.items():
+            value = values.get(key)
+            if isinstance(value, str) and value in allowed:
+                output[key] = value
         # Deliberately do not call getMessage()/formatException(): both may contain secrets.
         return json.dumps(output, ensure_ascii=True, allow_nan=False)
 
@@ -168,7 +186,12 @@ class RequestLoggingMiddleware:
             raise
         finally:
             if category is None:
-                category = _response_category(status)
+                outcome = state.get("stream_outcome")
+                category = (
+                    outcome
+                    if outcome in {"cancelled", "upstream_error"}
+                    else _response_category(status)
+                )
             diagnostics = state.get("proxy_diagnostics")
             degraded: list[str] = list(getattr(diagnostics, "degraded_dependencies", ()))
             if state.get("capture_status") == "unavailable" and "postgres" not in degraded:
@@ -185,6 +208,8 @@ class RequestLoggingMiddleware:
                     "retrieval_count": getattr(diagnostics, "retrieval_count", 0),
                     "injected_memory_tokens": getattr(diagnostics, "injected_memory_tokens", 0),
                     "degraded_dependencies": degraded,
+                    "stream_outcome": state.get("stream_outcome"),
+                    "capture_status": state.get("capture_status"),
                 },
             )
             _context.reset(token)

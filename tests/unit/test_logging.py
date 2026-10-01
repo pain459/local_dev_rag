@@ -66,6 +66,7 @@ def test_formatter_cannot_reflect_content_through_identifier_or_metric_fields():
     formatter = logging_module().SafeJSONFormatter()
     record = logging.LogRecord("untrusted", logging.ERROR, "", 1, PRIVATE, (), None)
     record.project_id = PRIVATE
+    record.request_id = PRIVATE
     record.session_id = PRIVATE
     record.job_id = PRIVATE
     record.model = ROOT
@@ -97,7 +98,10 @@ async def test_request_logs_safe_correlation_and_final_metrics(failure, streamin
             raise httpx.ConnectError(PRIVATE + ROOT)
         if streaming:
             return httpx.Response(
-                200, content=b"data: [DONE]\n\n", headers={"content-type": "text/event-stream"}
+                200,
+                content=b'data: {"choices":[{"delta":{"content":"private answer"},'
+                b'"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+                headers={"content-type": "text/event-stream"},
             )
         return httpx.Response(200, json={"choices": []})
 
@@ -124,7 +128,8 @@ async def test_request_logs_safe_correlation_and_final_metrics(failure, streamin
                 },
             )
         assert response.status_code == (502 if failure else 200)
-        assert response.headers["x-request-id"] == "request-safe-1"
+        opaque_id = response.headers["x-request-id"]
+        assert opaque_id != "request-safe-1"
     finally:
         await app.state.database.engine.dispose()
         logging.getLogger().removeHandler(handler)
@@ -134,7 +139,7 @@ async def test_request_logs_safe_correlation_and_final_metrics(failure, streamin
     final = [record for record in records if record["event"] == "request_completed"]
     assert len(final) == 1
     record = final[0]
-    assert record["request_id"] == "request-safe-1"
+    assert record["request_id"] == opaque_id
     assert record["project_id"] and record["session_id"]
     assert record["model"] == MODEL
     assert record["duration_ms"] >= 0
@@ -160,6 +165,98 @@ async def test_unsafe_request_id_and_invalid_request_are_logged_without_body_or_
         record = next(value for value in records if value["event"] == "request_completed")
         assert record["error_category"] == "validation_error"
         assert all(secret not in stream.getvalue() for secret in (PRIVATE, ROOT, quote(ROOT)))
+    finally:
+        await app.state.database.engine.dispose()
+        logging.getLogger().removeHandler(handler)
+
+
+@pytest.mark.parametrize(
+    "external_id",
+    [
+        b"sk-synthetic-private-credential",
+        b"",
+        b"z",
+        b"x" * 63,
+        b"x" * 64,
+        b"x" * 65,
+        b"x" * 4096,
+        b"0123456789abcdef01234567",
+        b"12345678-1234-1234-1234-123456789abc",
+        "sk-私密凭据".encode(),
+        quote(ROOT).encode(),
+    ],
+)
+@pytest.mark.parametrize("scenario", ["health", "success", "failure", "invalid", "stream"])
+async def test_external_correlation_and_matching_authorization_values_never_serialize(
+    external_id, scenario
+):
+    output, handler = capture_logs()
+    settings = Settings(
+        _env_file=None, database_url="postgresql+asyncpg://unused:unused@127.0.0.1:1/unused"
+    )
+
+    def upstream(request):
+        if scenario == "failure":
+            raise httpx.ConnectError("sk-synthetic-private-credential " + ROOT)
+        if scenario == "stream":
+            return httpx.Response(
+                200,
+                content=b'data: {"choices":[{"delta":{"content":"ok"},'
+                b'"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(200, json={"choices": []})
+
+    app = create_app(
+        settings, ollama_client=OllamaClient(settings, transport=httpx.MockTransport(upstream))
+    )
+    headers = [
+        (b"x-request-id", external_id),
+        (b"authorization", external_id),
+        (b"x-opencode-project-id", b"project"),
+        (b"x-opencode-session-id", b"session"),
+    ]
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+        ) as client:
+
+            async def request():
+                if scenario == "health":
+                    return await client.get("/healthz", headers=headers)
+                return await client.post(
+                    "/v1/chat/completions",
+                    headers=headers,
+                    json={
+                        "model": "unknown" if scenario == "invalid" else MODEL,
+                        "stream": scenario == "stream",
+                        "messages": [],
+                    },
+                )
+
+            first = await request()
+            second = await request()
+        assert first.status_code == (
+            502 if scenario == "failure" else 400 if scenario == "invalid" else 200
+        )
+        opaque = first.headers["x-request-id"]
+        assert opaque != external_id.decode("latin-1")
+        assert len(opaque) in (24, 36)
+        if external_id:
+            assert second.headers["x-request-id"] == opaque
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        finals = [record for record in records if record["event"] == "request_completed"]
+        assert len(finals) == 2
+        assert finals[0]["request_id"] == opaque
+        assert finals[1]["request_id"] == second.headers["x-request-id"]
+        for record in records:
+            if "request_id" in record:
+                assert record["request_id"] != external_id.decode("latin-1")
+                assert record["request_id"] in {opaque, second.headers["x-request-id"]}
+        if len(external_id) >= 8:
+            assert external_id.decode("latin-1") not in output.getvalue()
+        assert "sk-synthetic-private-credential" not in output.getvalue()
+        assert ROOT not in output.getvalue()
     finally:
         await app.state.database.engine.dispose()
         logging.getLogger().removeHandler(handler)
