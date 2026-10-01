@@ -1,6 +1,6 @@
 """Request identity: stable IDs are authoritative; roots are diagnostic metadata."""
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from types import MappingProxyType
@@ -158,6 +158,27 @@ class MemoryCandidate:
             object.__setattr__(
                 self, "score_components", MappingProxyType(dict(self.score_components))
             )
+
+
+@dataclass(frozen=True)
+class ChatRequest:
+    model: str
+    messages: Sequence[Mapping[str, object]]
+    stream: bool
+    extra: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "messages", tuple(_freeze_payload(m) for m in self.messages))
+        object.__setattr__(self, "extra", _freeze_payload(self.extra))
+
+
+@dataclass(frozen=True)
+class ContextBuildResult:
+    payload: dict[str, object]
+    included_event_ids: tuple[str, ...]
+    dropped_event_ids: tuple[str, ...]
+    estimated_input_tokens: int
+    injected_memory_tokens: int
 
 
 @dataclass(frozen=True)
