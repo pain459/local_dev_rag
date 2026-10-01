@@ -279,6 +279,18 @@ def _fact_terms(text: str) -> set[str]:
     }
 
 
+def _complete_action_clause(clause: str) -> bool:
+    """A new predicate alone is coordination, not a complete consequent."""
+    predicate = _PREDICATE.search(clause)
+    if predicate is None:
+        return False
+    prefix = clause[: predicate.start()]
+    return bool(
+        re.match(r"^\s*(?:we|i|they|the team|the project)\b", prefix, re.I)
+        or _PASSIVE_PREFIX.fullmatch(prefix)
+    )
+
+
 def _option_evidence(
     records: list[dict[str, object]],
 ) -> tuple[set[str], set[str], list[set[str]]]:
@@ -293,17 +305,23 @@ def _option_evidence(
             antecedent = False
             inherited: Polarity | None = None
             previous: set[str] = set()
-            for clause in _evidence_clauses(statement):
+            clauses = _evidence_clauses(statement)
+            # A serial antecedent may contain several predicate-bearing commas.
+            # Only its final complete comma-delimited action can introduce the
+            # consequent; bare predicates/context fragments remain coordinated.
+            consequent_boundaries = {
+                index
+                for index, clause in enumerate(clauses[:-1])
+                if clause == "," and _complete_action_clause(clauses[index + 1])
+            }
+            consequent_boundary = max(consequent_boundaries, default=-1)
+            for index, clause in enumerate(clauses):
                 connector = " ".join(clause.split()).casefold()
                 if connector in {"instead of", "rather than"}:
                     inherited = "rejected"
                     continue
                 if connector in {"and", ",", "but", "while", "whereas", "however"}:
-                    if connector == ",":
-                        # Clause splitting emits this delimiter only at a new
-                        # clause, retaining nominal lists/incidental commas.
-                        # Predicates before it belong to the fronted condition;
-                        # predicates after it can govern the consequent.
+                    if connector == "," and index == consequent_boundary:
                         antecedent = False
                     if connector not in {"and", ","}:
                         inherited = None

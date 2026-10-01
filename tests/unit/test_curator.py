@@ -1158,3 +1158,119 @@ async def test_trailing_condition_on_infinitive_keeps_independent_certain_siblin
         MemoryDraft(kind, "Use NATS.", 0.9, 0.8),
         MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8),
     ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("predicate", ANTECEDENT_PREDICATES)
+@pytest.mark.parametrize("connector", ["but", "while", "whereas", "however"])
+@pytest.mark.parametrize("context", ["", "For caching, "])
+async def test_comma_coordinated_antecedent_predicate_cannot_clear_condition(
+    kind, predicate, connector, context
+):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(kind=kind, text="Use Redis."),
+                        candidate(kind=kind, text="Use MongoDB."),
+                        candidate(kind=kind, text="Use NATS."),
+                        candidate(text="Use PostgreSQL."),
+                    ]
+                }
+            )
+        )
+    )
+    evidence = (
+        f"We selected PostgreSQL. {context}If we selected MongoDB, {predicate} NATS "
+        f"{connector} latency remains high, we will use Redis."
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    "antecedent",
+    [
+        "If we selected MongoDB, rejected NATS, declined SQLite",
+        "If we selected MongoDB, and we rejected NATS",
+        "If we selected MongoDB, we rejected NATS",
+        "If we selected MongoDB, we did not use NATS",
+        "If we selected MongoDB, we didn't use NATS",
+        "If we selected MongoDB, we didn’t use NATS",
+        "If we selected MongoDB, for caching, rejected NATS",
+        "If we selected MongoDB, in this project, did not use NATS",
+        "If we selected MongoDB, we considered NATS, we confirmed SQLite",
+        "If we selected MongoDB, selected NATS, confirmed SQLite",
+        "If we selected MongoDB, we will use NATS, we rejected SQLite",
+        "If we selected MongoDB, for caching, we rejected NATS",
+    ],
+)
+@pytest.mark.parametrize("connector", ["but", "while", "whereas", "however"])
+async def test_serial_antecedent_commas_and_context_keep_governed_action_conditional(
+    kind, antecedent, connector
+):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(kind=kind, text="Use Redis."),
+                        candidate(text="Use PostgreSQL."),
+                    ]
+                }
+            )
+        )
+    )
+    evidence = (
+        f"We selected PostgreSQL. {antecedent} {connector} latency remains high, we will use Redis."
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    "consequent", ["we will use Redis", "we selected Redis", "we rejected Redis"]
+)
+@pytest.mark.parametrize("connector", ["but", "while", "whereas", "however"])
+async def test_true_consequent_comma_allows_independent_certain_sibling(
+    kind, consequent, connector
+):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [
+                        candidate(kind=kind, text="Use Redis."),
+                        candidate(kind=kind, text="Use PostgreSQL."),
+                    ]
+                }
+            )
+        )
+    )
+    evidence = (
+        f"If we selected MongoDB, rejected NATS, {consequent}, {connector} we selected PostgreSQL."
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft(kind, "Use PostgreSQL.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    "predicate", ["selected", "rejected", "did not use", "didn't use", "didn’t use"]
+)
+async def test_unconditional_serial_predicate_commas_preserve_certain_decision(kind, predicate):
+    instance = curator(
+        lambda request: response(
+            json.dumps({"memories": [candidate(kind=kind, text="Use PostgreSQL.")]})
+        )
+    )
+    evidence = f"We selected MongoDB, {predicate} NATS, but we selected PostgreSQL."
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft(kind, "Use PostgreSQL.", 0.9, 0.8)
+    ]
