@@ -23,8 +23,20 @@ _FILLER = re.compile(
     r"|thanks(?: for your help)?|thank you)[.!\s]*",
     re.I,
 )
+_CONFIRMED = re.compile(
+    r"\b(decided\s+to|selected|chose|chosen|confirmed|agreed\s+to|will\s+use"
+    r"|must|required|fixed|completed)\b",
+    re.I,
+)
+_REJECTED = re.compile(
+    r"\b(not\s+(?:to\s+)?(?:use|select(?:ed)?|choose|chosen)"
+    r"|reject(?:ed)?|ruled\s+out|declined|avoid)\b",
+    re.I,
+)
 _SECRET = re.compile(
-    r"(?:\b(?:api[ _-]?key|access[ _-]?token|secret|password|passwd|credential)\s*[:=]\s*\S+"
+    r"(?:\b(?:api[ _-]?key|(?:access|refresh|auth)[ _-]?token|(?:client[ _-]?)?secret"
+    r"|password|passwd|credentials?)[\"']?\s*[:=]\s*[\"']?\S+"
+    r"|\b[a-z][a-z0-9+.-]*://[^/\s@]*:[^/\s@]+@"
     r"|\bBearer\s+\S+|\bsk-[A-Za-z0-9_-]{16,}|\bgh[pousr]_[A-Za-z0-9]{20,}"
     r"|\bAKIA[A-Z0-9]{16}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----)",
     re.I,
@@ -96,13 +108,20 @@ def _unselected_terms(records: list[dict[str, object]]) -> tuple[bool, set[str]]
     """
     selected: set[str] = set()
     unselected: set[str] = set()
+    rejected: set[str] = set()
     for record in records:
         for statement in re.split(r"[.!?;\n]", cast(str, record["excerpt"])):
-            if _SPECULATIVE.search(statement):
-                unselected.update(_terms(statement))
-            else:
-                selected.update(_terms(statement))
-    return bool(unselected) and not selected, unselected - selected
+            terms = _terms(statement)
+            if _REJECTED.search(statement):
+                rejected.update(terms)
+                selected.difference_update(terms)
+            elif _SPECULATIVE.search(statement):
+                unselected.update(terms)
+            elif _CONFIRMED.search(statement):
+                selected.update(terms)
+                rejected.difference_update(terms)
+    excluded = (unselected | rejected) - selected
+    return bool(excluded) and not selected, excluded
 
 
 class Curator:

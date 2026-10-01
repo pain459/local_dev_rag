@@ -291,3 +291,78 @@ async def test_timeout_during_response_body_closes_the_upstream_stream():
     with pytest.raises(TimeoutError):
         await instance.extract(source())
     assert body.closed
+
+
+@pytest.mark.parametrize(
+    "unsafe",
+    [
+        'Configuration uses {"password": "hunter2"}.',
+        "Configuration uses {'api_key': 'private-value'}.",
+        'Settings use {"access_token": "private-value"}.',
+        'Nested settings use {"credentials": {"client_secret": "private-value"}}.',
+        "The database URL is postgresql://postgres:hunter2@localhost:5432/db.",
+        "The cache URL is redis://:hunter2@localhost:6379/0.",
+        "The URL is https://user:pass%40word@example.test/api.",
+    ],
+)
+async def test_structured_credentials_and_authenticated_urls_reject_only_unsafe_draft(unsafe):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [candidate(text=unsafe), candidate()],
+                }
+            )
+        )
+    )
+    assert await instance.extract(source()) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "Redis is available. Maybe use Redis for caching later; no decision was made.",
+        "We evaluated Redis but decided not to use it.",
+        "Redis was evaluated and rejected.",
+        "We decided to use Redis. We later decided not to use Redis.",
+    ],
+)
+async def test_mentions_and_explicit_rejection_do_not_confirm_an_option(evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [candidate(text="Use Redis."), candidate()],
+                }
+            )
+        )
+    )
+    incoming = source(evidence + " We decided to use PostgreSQL for durable memory.")
+    assert await instance.extract(incoming) == [
+        MemoryDraft("decision", "Use PostgreSQL for durable memory.", 0.9, 0.8)
+    ]
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        "Maybe use Redis for caching. We decided to use Redis.",
+        "Redis is available. We selected Redis for caching.",
+        "We evaluated Redis and chose Redis for caching.",
+    ],
+)
+async def test_explicit_confirmation_allows_an_evaluated_or_speculative_option(evidence):
+    instance = curator(
+        lambda request: response(
+            json.dumps(
+                {
+                    "memories": [candidate(text="Use Redis.")],
+                }
+            )
+        )
+    )
+    assert await instance.extract(source(evidence)) == [
+        MemoryDraft("decision", "Use Redis.", 0.9, 0.8)
+    ]

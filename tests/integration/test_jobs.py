@@ -269,6 +269,22 @@ async def test_curator_source_is_bounded_ordered_and_never_includes_future_or_ot
     async with database.session() as session:
         repository = ConversationRepository(session)
         scope = await repository.ensure_scope(RequestIdentity("s", "p"))
+        for other_scope in (
+            await repository.ensure_scope(RequestIdentity("other-session", "p")),
+            await repository.ensure_scope(RequestIdentity("s", "other-project")),
+        ):
+            await repository.append_events(
+                other_scope,
+                [
+                    ConversationEventInput(
+                        event_type="message",
+                        role="user",
+                        payload={"content": "foreign evidence"},
+                        content_hash="foreign",
+                        request_id="foreign",
+                    )
+                ],
+            )
         for index in range(4):
             await repository.append_events(
                 scope,
@@ -282,6 +298,34 @@ async def test_curator_source_is_bounded_ordered_and_never_includes_future_or_ot
                     )
                 ],
             )
+        excluded = await repository.append_events(
+            scope,
+            [
+                ConversationEventInput(
+                    event_type="message",
+                    role="assistant",
+                    payload={"content": "partial"},
+                    content_hash="partial",
+                    request_id="partial",
+                    completed=False,
+                ),
+                ConversationEventInput(
+                    event_type="message",
+                    role="system",
+                    payload={"content": "system instruction"},
+                    content_hash="system",
+                    request_id="system",
+                ),
+                ConversationEventInput(
+                    event_type="attempt",
+                    role="proxy",
+                    payload={"status": "incomplete"},
+                    content_hash="proxy",
+                    request_id="proxy",
+                    completed=False,
+                ),
+            ],
+        )
         completed = await repository.finalize_assistant(
             scope,
             AssistantCompletion(
@@ -306,6 +350,20 @@ async def test_curator_source_is_bounded_ordered_and_never_includes_future_or_ot
         incoming = await repository.curator_source(completed.id, max_events=3)
         assert incoming.project_id == scope.project_id and incoming.session_id == scope.session_id
         assert incoming.source_event_id == completed.id
-        assert [event.sequence for event in incoming.events] == [3, 4, 5]
+        assert [event.sequence for event in incoming.events] == [3, 4, 8]
+        all_history = await repository.curator_source(completed.id)
+        assert [event.payload["content"] for event in all_history.events] == [
+            "0",
+            "1",
+            "2",
+            "3",
+            "decision",
+        ]
+        assert all(
+            event.project_id == scope.project_id and event.session_id == scope.session_id
+            for event in all_history.events
+        )
+        for event in excluded:
+            assert event.id not in {stored.id for stored in all_history.events}
         with pytest.raises(ValueError):
             await repository.curator_source(uuid4())
