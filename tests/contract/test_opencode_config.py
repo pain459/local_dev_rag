@@ -4,7 +4,6 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from dotenv import dotenv_values
 
 from local_dev_rag.config import Settings
 from local_dev_rag.domain import RequestIdentity
@@ -50,17 +49,30 @@ def test_deployment_budgets_match_proxy_and_opencode(monkeypatch, env_filename):
     for name in os.environ:
         if name.casefold().startswith("model_budgets__"):
             monkeypatch.delenv(name)
-    deployment_budgets = json.loads(dotenv_values(env_path)["MODEL_BUDGETS"])
-    defaults = Settings(_env_file=None).model_budgets
-    assert deployment_budgets == EXPECTED_BUDGETS
-    proxy_budgets = {model_id: budget.model_dump() for model_id, budget in defaults.items()}
+    effective_budgets = Settings(_env_file=env_path).model_budgets
+    proxy_budgets = {
+        model_id: budget.model_dump() for model_id, budget in effective_budgets.items()
+    }
     assert proxy_budgets == EXPECTED_BUDGETS
     models = json.loads((ROOT / "opencode.json").read_text())["provider"]["local-rag"]["models"]
-    for model_id, budget in deployment_budgets.items():
+    for model_id, budget in proxy_budgets.items():
         assert models[model_id]["limit"] == {
             "context": budget["context_tokens"],
             "output": budget["output_tokens"],
         }
+
+
+@pytest.mark.parametrize("env_filename", [".env.example", ".env"])
+def test_deployment_budget_contract_rejects_conflicting_nested_override(
+    monkeypatch, tmp_path, env_filename
+):
+    env_path = tmp_path / env_filename
+    env_path.write_text(
+        (ROOT / ".env.example").read_text()
+        + "\nMODEL_BUDGETS__QWEN3-CODER:30B__CONTEXT_TOKENS=32768\n"
+    )
+    with pytest.raises(AssertionError):
+        test_deployment_budgets_match_proxy_and_opencode(monkeypatch, str(env_path))
 
 
 def plugin_headers(
