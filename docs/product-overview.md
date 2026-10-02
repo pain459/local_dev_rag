@@ -130,7 +130,7 @@ If your main requirement is local models, both deserve consideration. Run the sa
 
 ## Privacy, boundaries, and prerequisites
 
-The default Compose setup publishes only the proxy on `127.0.0.1:8080`; PostgreSQL and Chroma have no published host ports. Ollama must be reachable by the containers through a suitably restricted host listener. Keep the deployment single-user and local: project filtering is not access control, and the proxy/Ollama listeners do not provide authentication suitable for untrusted networks.
+The default Compose setup publishes only the proxy on `127.0.0.1:8080`; PostgreSQL and Chroma have no published host ports. Optional [database GUI access](operations-guide.md#optional-local-database-gui) uses `make up EXPOSE_DB=1` to publish PostgreSQL only on loopback; Chroma remains private. Ollama must be reachable by the containers through a suitably restricted host listener. Keep the deployment single-user and local: project filtering is not access control, and the proxy/Ollama listeners do not provide authentication suitable for untrusted networks.
 
 Raw conversation and tool events can contain sensitive code, credentials, and personal information. Candidate screening does not redact PostgreSQL events or guarantee secret removal. Protect volumes, host sessions, exports, and backups. The stack provides no automatic encryption, retention policy, deletion UI, or public memory-erasure API. Deleting an OpenCode session does not erase the RAG database.
 

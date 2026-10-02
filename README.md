@@ -26,11 +26,47 @@ make ready
 opencode --model local-rag/qwen2.5-coder:7b
 ```
 
-`essentials` preserves an existing `.env`, downloads/builds assets, and does not start the stack. Ollama must be reachable from containers at `OLLAMA_URL`; see the [listener guidance](docs/user-guide.md#host-assumptions-and-prerequisites). `make launch REPO=/path/to/repo` opens another coding project with this checkout's provider and memory plugin. Use `make help` for commands and the [setup test ladder](docs/user-guide.md#setup-test-ladder) before relying on recall. `make smoke` runs real inference and retains synthetic records in your database.
+`essentials` preserves an existing `.env`, downloads/builds assets, and does not start the stack. Ollama must be reachable from containers at `OLLAMA_URL`; see the [listener guidance](docs/user-guide.md#host-assumptions-and-prerequisites). Use `make help` for commands and the [setup test ladder](docs/user-guide.md#setup-test-ladder) before relying on recall. `make smoke` runs real inference and retains synthetic records in your database.
+
+## Use another repository
+
+The recommended hardened launcher loads this checkout's provider and memory plugin and protects the `local-rag` provider from target configuration overrides:
+
+```sh
+make launch REPO=/path/to/repo
+```
+
+For direct execution from the target repository:
+
+```sh
+LOCAL_RAG_HOME=/path/to/local_dev_rag
+cd /path/to/repo
+OPENCODE_CONFIG="$LOCAL_RAG_HOME/opencode.json" \
+  OPENCODE_CONFIG_DIR="$LOCAL_RAG_HOME/.opencode" \
+  OPENCODE_PURE=0 opencode .
+```
+
+The direct form omits the launcher's inline post-merge provider snapshot. Target configuration can still merge or override provider settings, including endpoints and limits; use `make launch` when those protections matter. See [another-repository use](docs/user-guide.md#everyday-use-and-model-switching) for model selection and details.
+
+## Optional database GUI access
+
+PostgreSQL is private by default. For a local DBeaver or pgAdmin connection, pause clients before changing ports, then run:
+
+```sh
+docker compose stop proxy worker
+make up EXPOSE_DB=1
+make ready
+# Optional: apply a different free host port, including to an existing stack.
+docker compose stop proxy worker
+make recreate EXPOSE_DB=1 POSTGRES_INSPECT_PORT=15433
+make ready
+```
+
+The default verified mapping is `127.0.0.1:5433` to PostgreSQL's internal `5432`; a custom port changes only the host side. Chroma stays private. Disconnect the GUI and pause clients, then run `make recreate` (or `make recreate EXPOSE_DB=0`) with the normal base configuration to remove PostgreSQL host access while preserving named volumes. `make restart` does not remove the port. See the [GUI runbook](docs/operations-guide.md#optional-local-database-gui) for connection fields, writer shutdown, and verification.
 
 ## Safety and limits
 
-Keep this a single-user local deployment. Only the proxy is published, on `127.0.0.1:8080` by default; PostgreSQL and Chroma have no host ports. The proxy and Ollama do not provide authentication suitable for an untrusted network. Do not expose them through a public bind or tunnel. Conversation/tool content is stored in PostgreSQL and can be sensitive; protect volumes and backups. Changing `.env` credentials does not rotate an initialized database's credentials.
+Keep this a single-user local deployment. By default only the proxy is published, on `127.0.0.1:8080`; PostgreSQL and Chroma have no host ports. Opt-in PostgreSQL inspection is loopback-only through `compose.inspect.yaml`; Chroma remains unpublished. The proxy and Ollama do not provide authentication suitable for an untrusted network. Do not expose them through a public bind or tunnel. Conversation/tool content is stored in PostgreSQL and can be sensitive; protect volumes and backups. Changing `.env` credentials does not rotate an initialized database's credentials.
 
 Compose health is weaker than inference readiness: `make up` can succeed with unavailable Ollama. Require `make ready`, a real prompt, and matching runtime context. The default Qwen3 and Llama policies declare 65536 tokens, but **that does not allocate 64K in Ollama**. Verify `ollama ps` after a request and follow [both supported remedies](docs/operations-guide.md#runtime-context-acceptance) if allocation is smaller. A short successful reply does not prove safe long-context operation.
 

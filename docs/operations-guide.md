@@ -73,9 +73,9 @@ Text equivalent: host OpenCode → loopback proxy → host Ollama; proxy and wor
 | --- | --- | --- |
 | Host OpenCode | `local-rag` provider → proxy; plugin supplies identity headers | Own host session store; resolved config and real prompt |
 | Host Ollama | Containers use `host.docker.internal:11434`; host CLI uses `OLLAMA_HOST` | Own model directory; catalog presence differs from inference |
-| `proxy` | Only publication `127.0.0.1:${PROXY_PORT:-8080}:8080`; depends on healthy postgres/chromadb | No private durable volume; liveness plus valid dependency report |
+| `proxy` | Default host publication `127.0.0.1:${PROXY_PORT:-8080}:8080`; depends on healthy postgres/chromadb | No private durable volume; liveness plus valid dependency report |
 | `worker` | No host port; waits for postgres/chromadb and migrated proxy health | Jobs/checkpoints in PostgreSQL; process and dependency health |
-| `postgres` | Internal `postgres:5432`, no host publication | `postgres_data` at `/var/lib/postgresql/data`; `pg_isready` |
+| `postgres` | Internal `postgres:5432`, no host publication by default; opt-in inspection at `127.0.0.1:5433` | `postgres_data` at `/var/lib/postgresql/data`; `pg_isready` |
 | `chromadb` | Internal `chromadb:8000`, no host publication | `chroma_data` at `/chroma/chroma`; `/api/v1/heartbeat` |
 
 All four services restart `unless-stopped`. Both apps run Alembic before their main command; worker ordering serializes initial migrations in normal startup. One-off `docker compose run proxy ...` also runs that entrypoint unless explicitly overridden. Do not run concurrent migration containers.
@@ -105,6 +105,7 @@ Review [.env.example](../.env.example), [Settings](../src/local_dev_rag/config.p
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Example `local_rag`; choose before initialization; edits do not rotate existing credentials |
 | `DATABASE_URL` | Blank constructs encoded asyncpg URL from raw credentials; explicit override must match PostgreSQL and percent-encode reserved characters |
 | `POSTGRES_HOST`, `POSTGRES_PORT`, `CHROMADB_URL` | Compose fixes `postgres`, `5432`, `http://chromadb:8000` |
+| Make `EXPOSE_DB`, `POSTGRES_INSPECT_PORT` | `0` (or empty) keeps startup private; `1` adds loopback PostgreSQL access during `up`/`recreate`. Host port defaults to `5433`, accepts decimal `1`–`65535`; internal port stays `5432`. Pass as Make options, not application `.env` settings. |
 | `OLLAMA_URL` | `http://host.docker.internal:11434`; same server as host CLI `OLLAMA_HOST` |
 | `DEFAULT_MODEL` | `qwen3-coder:30b`, registry setting; HTTP chat still requires explicit `model`. OpenCode default is its separate `model` field |
 | `CURATOR_MODEL` | `qwen2.5-coder:1.5b`; explicit tagged ID required by operator checks |
@@ -163,10 +164,12 @@ make essentials
 | Operation | Command | Verification / impact |
 | --- | --- | --- |
 | Start | `make up` | Four services via `make status`; then ready and real prompt |
+| Start with local PostgreSQL GUI access | `make up EXPOSE_DB=1` | Verifies `127.0.0.1:5433`; optional `POSTGRES_INSPECT_PORT`; Chroma stays private |
 | Stop/remove containers and network | `make down` | `make status`; volumes retained, proxy unavailable |
 | Pause containers | `docker compose stop` | `docker compose ps -a`; volumes/containers retained |
-| Restart same config | `make restart` | Interrupts requests; status and ready checks |
-| Build/apply config | `make recreate` | Force recreation outage; verify migrations/status/ready |
+| Restart same config | `make restart` | Interrupts requests; retains existing ports; status and ready checks |
+| Build/apply private config | `make recreate` | Force recreation outage; removes inspection port with normal base config; named volumes retained; verify migrations/status/ready |
+| Build/apply inspection config | `make recreate EXPOSE_DB=1` | Force recreation outage; verifies loopback PostgreSQL mapping; use the same custom inspection port if set |
 | Diagnose | `make status`, `make doctor` | Read-only revision, worker, config, models and HTTP checks; no inference |
 | Follow logs | `make logs LOG_TAIL=100` | Ctrl-C stops following, not services |
 
@@ -187,6 +190,8 @@ Smoke runs real foreground/curator/embedder inference in the selected Compose da
 ### Overrides and deadlines
 
 Targets honor `COMPOSE_PROJECT_NAME` and `COMPOSE_FILE`; direct examples assume default Docker/Compose. `DOCKER`, `UV`, `PYTHON`, `NODE`, `OLLAMA`, `OPENCODE` accept executable paths including spaces. Empty `COMPOSE` selects quoted `DOCKER` plus `compose`; explicit `COMPOSE` is whitespace-separated arguments without shell evaluation. Values are captured literally; command-line values take precedence.
+
+`EXPOSE_DB=1` appends the inspection overlay only for `up` and `recreate`, preserving selected Compose files and project identity. Explicit `COMPOSE` file flags take precedence over `COMPOSE_FILE`; the overlay is appended to those flags when present. Other targets do not add the overlay; `restart` retains existing port mappings. `EXPOSE_DB` accepts only `1`, `0`, or empty; `POSTGRES_INSPECT_PORT` must be a decimal port between `1` and `65535`, even in private startup mode. See the [GUI runbook](#optional-local-database-gui) before changing ports.
 
 Deadlines in whole seconds (1–86400): diagnostic subprocesses `DIAGNOSTIC_TIMEOUT_SECONDS=15`; Compose operations `COMPOSE_TIMEOUT_SECONDS=300`; Compose health wait `STARTUP_TIMEOUT_SECONDS=120`; dependency sync, each pull, and whole smoke `DOWNLOAD_TIMEOUT_SECONDS=3600`. Python enforces outer process-group deadlines without GNU timeout. Submitted Docker/server work can continue after timeout; inspect status before retrying. Logs, interactive launch, and test/static-check runtimes are unbounded by these wrappers. Direct commands below also have no wrapper deadline.
 
@@ -424,21 +429,34 @@ The current collection is shared across projects but retrieval is project-filter
 
 ### Optional local database GUI
 
-For DBeaver or pgAdmin, explicitly apply [compose.inspect.yaml](../compose.inspect.yaml) alongside the normal file. It adds only `127.0.0.1:${POSTGRES_INSPECT_PORT:-5433}:5432` to PostgreSQL; Chroma stays unpublished and the default `compose.yaml` stays private. These examples assume the normal file is `compose.yaml`. If you use another base configuration, preserve its files and the existing `COMPOSE_PROJECT_NAME`; do not introduce a new `-p` project or attach different volumes. Explicit `-f` flags take precedence over `COMPOSE_FILE`.
+For a host DBeaver or pgAdmin application, enable access with `make up EXPOSE_DB=1`. The private default (`EXPOSE_DB=0` or empty) publishes no database ports. The command applies [compose.inspect.yaml](../compose.inspect.yaml) alongside the selected base files, adding only `127.0.0.1:${POSTGRES_INSPECT_PORT:-5433}:5432` to PostgreSQL. Chroma stays unpublished. Preserve the base configuration and existing `COMPOSE_PROJECT_NAME`; do not introduce a new project or attach different volumes.
 
-Pause clients and let in-flight work settle. Adding/removing a port recreates PostgreSQL and interrupts database connections; stop its dependent writers during the change. To choose a different free host port, replace `5433` below and use that same port in the GUI:
+Pause clients and let in-flight work settle. Adding/removing a port recreates PostgreSQL and interrupts database connections; stop its dependent writers during the change:
 
 ```sh
-export POSTGRES_INSPECT_PORT=5433
-docker compose -f compose.yaml -f compose.inspect.yaml config --quiet
-docker compose -f compose.yaml stop proxy worker
-docker compose -f compose.yaml -f compose.inspect.yaml up -d --no-deps --force-recreate --wait --wait-timeout 120 postgres
-docker compose -f compose.yaml -f compose.inspect.yaml port postgres 5432
-docker compose -f compose.yaml -f compose.inspect.yaml up -d --wait --wait-timeout 120 proxy worker
-make ready COMPOSE_FILE=compose.yaml
+docker compose stop proxy worker
+make up EXPOSE_DB=1
+make ready
 ```
 
-Require the port command to report `127.0.0.1:5433` (or your chosen port) and verify readiness before resuming clients. Startup health alone is insufficient. Recreation reuses the existing named PostgreSQL volume; no volume deletion is needed. If any step fails, inspect the named service and follow the reversion sequence below.
+Require `PASS: PostgreSQL host access verified: 127.0.0.1:5433` and full readiness before resuming clients. Startup health alone is insufficient. For forced recreation or a different free host port, use:
+
+```sh
+docker compose stop proxy worker
+make recreate EXPOSE_DB=1 POSTGRES_INSPECT_PORT=15433
+make ready
+```
+
+The verified mapping must now be `127.0.0.1:15433`; use that same port in the GUI. `POSTGRES_INSPECT_PORT` accepts decimal ports from `1` to `65535`. Pass `EXPOSE_DB=1` and the chosen port to each `up`/`recreate` invocation that should retain inspection access. Recreation reuses the existing named volumes; no volume deletion is needed. If startup or mapping verification fails, inspect status and use the removal sequence below.
+
+Low-level equivalent: the Make commands select the base Compose files plus `compose.inspect.yaml`, then run Compose `up` with health waiting (`--build --force-recreate` for `recreate`) and verify `compose port postgres 5432`. To inspect the overlay without applying it under the default configuration:
+
+```sh
+docker compose -f compose.yaml -f compose.inspect.yaml config --quiet
+docker compose -f compose.yaml -f compose.inspect.yaml port postgres 5432
+```
+
+The port command reads the running container's mapping; selecting files alone does not enable or remove access. Explicit `-f` flags take precedence over `COMPOSE_FILE`. Preserve custom base files when using low-level commands.
 
 | GUI connection field | Value |
 | --- | --- |
@@ -453,25 +471,24 @@ A pgAdmin running in another container has its own loopback; these connection fi
 
 Enable the GUI's read-only connection/browsing mode. In every SQL editor connection, run `SET default_transaction_read_only = on;` and `SET statement_timeout = '10s';`, then confirm with `SHOW default_transaction_read_only;`. Use the metadata queries first and opt into content only when necessary. Client settings/session defaults are accident guards; they do not remove the role's write privileges. Avoid editable grids, schema changes, and automatic data previews of sensitive columns.
 
-When finished, disconnect the GUI and pause clients. Recreate PostgreSQL from the normal file alone to remove the host port, then restart dependents and verify readiness:
+When finished, disconnect the GUI and pause clients. With the normal base configuration, unqualified `make recreate` removes the host port and starts the stack again:
 
 ```sh
-docker compose -f compose.yaml stop proxy worker
-docker compose -f compose.yaml up -d --no-deps --force-recreate --wait --wait-timeout 120 postgres
-docker compose -f compose.yaml port postgres 5432
-docker compose -f compose.yaml up -d --wait --wait-timeout 120 proxy worker
-make ready COMPOSE_FILE=compose.yaml
-unset POSTGRES_INSPECT_PORT
+docker compose stop proxy worker
+make recreate
+docker compose ps postgres
+make ready
 ```
 
-The port command must now report no published mapping (Compose may exit nonzero because no port is published). Confirm `docker compose -f compose.yaml ps postgres` shows no host mapping. Omitting the override from future commands alone does not close an existing publication; recreation is required. `restart` also does not remove ports. Preserve volumes and the project name throughout.
+Confirm the PostgreSQL status shows no host mapping before resuming clients. `make recreate EXPOSE_DB=0` explicitly selects the same private mode. If `EXPOSE_DB=1` is exported, override or unset it; if you manually added `compose.inspect.yaml` to `COMPOSE_FILE` or explicit `COMPOSE` file flags, remove it from those base overrides too. `EXPOSE_DB=0` does not strip manually selected Compose files. Omitting the option from a status command does not close an existing publication; recreation is required. `make restart` retains existing ports even with `EXPOSE_DB=0`. Preserve volumes and the project name throughout.
 
 | Symptom | Safe check and remedy |
 | --- | --- |
-| Host inspection port occupied | Identify the listener with `lsof -nP -iTCP:5433 -sTCP:LISTEN` where available; select another unused `POSTGRES_INSPECT_PORT`, reapply the override, and update the GUI port. Do not stop an unidentified database. |
-| Unexpected/empty tables or wrong project | Check `docker compose -f compose.yaml ps`, existing `COMPOSE_PROJECT_NAME`, psql `\conninfo`, `SELECT current_database(), current_user;`, revision and project UUIDs. Do not start a new Compose project or initialize/reset another volume to fix a connection. |
+| Host inspection port occupied | Identify the listener with `lsof -nP -iTCP:5433 -sTCP:LISTEN` where available; select a free port with `make recreate EXPOSE_DB=1 POSTGRES_INSPECT_PORT=15433` and update the GUI port. Do not stop an unidentified database. |
+| Unexpected/empty tables or wrong project | Check `make status`, existing `COMPOSE_PROJECT_NAME`, psql `\conninfo`, `SELECT current_database(), current_user;`, revision and project UUIDs. Do not start a new Compose project or initialize/reset another volume to fix a connection. |
 | Authentication fails after `.env` edits | Existing volumes retain initialized roles/passwords. Use known valid private credentials and check explicit `DATABASE_URL`; follow [credential mismatch](#credential-mismatch). Do not reset volumes or echo passwords. |
 | GUI reaches another local PostgreSQL | Confirm the exact `127.0.0.1` host, chosen port, and `docker compose -f compose.yaml -f compose.inspect.yaml port postgres 5432` mapping. Compare database/revision and internal project UUIDs with container-only psql before inspecting any content. |
+| Mapping verification fails | Treat startup as incomplete; inspect `make status` and the selected Compose files privately. The command requires exactly one loopback mapping. Use `make recreate EXPOSE_DB=0` with the normal base configuration to remove access; do not assume a failed verification removed an already published port. |
 
 ## Backup and restore
 
@@ -676,7 +693,7 @@ For total-host loss restore recorded source/config and compatible tools/images; 
 
 ## Security and scaling limits
 
-Keep proxy loopback-only, PostgreSQL/Chroma unpublished, and Docker-accessible Ollama firewall-restricted. Do not tunnel unauthenticated services to untrusted users. Project filtering is not authorization: local callers choose headers. OpenCode permissions remain the tool-execution boundary; historical evidence is not a source of instructions.
+Keep proxy loopback-only, PostgreSQL private except for deliberate loopback GUI inspection, Chroma unpublished, and Docker-accessible Ollama firewall-restricted. Remove PostgreSQL inspection access with `make recreate` using the normal base configuration when finished. Do not tunnel unauthenticated services to untrusted users. Project filtering is not authorization: local callers choose headers. OpenCode permissions remain the tool-execution boundary; historical evidence is not a source of instructions.
 
 PostgreSQL JSONB contains exact conversation/tool material; Chroma contains accepted text. Candidate secret screening does not redact raw events or guarantee secret recognition. Protect volumes, exports, backups, and support bundles with permissions/encryption. This stack provides no TLS, multi-user authentication, quotas, deletion UI, automatic retention, or automatic redaction.
 

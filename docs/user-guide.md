@@ -10,6 +10,7 @@ Commands below run from the `local_dev_rag` checkout unless a different director
 - [Five-minute path](#five-minute-path)
 - [Host assumptions and prerequisites](#host-assumptions-and-prerequisites)
 - [Clone, configure, and start](#clone-configure-and-start)
+- [Optional database GUI access](#optional-database-gui-access)
 - [Models, capacity, and runtime context](#models-capacity-and-runtime-context)
 - [Setup test ladder](#setup-test-ladder)
 - [Everyday use and model switching](#everyday-use-and-model-switching)
@@ -31,7 +32,7 @@ OpenCode is the coding interface: it owns the terminal UI, coding tools, permiss
 | `postgres` | Docker | Authoritative events, memories, provenance, and processing state |
 | `chromadb` | Docker | Rebuildable semantic index of accepted memories |
 
-The stack publishes only `127.0.0.1:8080`. PostgreSQL and Chroma have no published host ports. Keep this a single-user deployment: the proxy has no authentication suitable for an untrusted network. Do not publish these services through a tunnel or change the proxy publication to a public interface.
+By default the stack publishes only `127.0.0.1:8080`. PostgreSQL and Chroma have no published host ports. Opt-in PostgreSQL GUI access stays on host loopback; Chroma remains private. Keep this a single-user deployment: the proxy has no authentication suitable for an untrusted network. Do not publish these services through a tunnel or change the proxy publication to a public interface.
 
 “Durable history” means history can outlive a model's context window and an OpenCode session. It does not mean infinite context, unlimited disk space, or guaranteed recall. By default each request can inject at most six relevant memories within a 1024-token memory budget, alongside bounded recent conversation. A completed turn can produce no accepted memories. Store requirements that must never be missed in a reviewed repository document too.
 
@@ -158,6 +159,39 @@ Expected revision: `0001 (head)` for this unreleased initial schema. An older in
 
 `/healthz` should return `{"status":"ok"}`. `/readyz` should say `ready` with `postgres`, `chromadb`, `ollama`, `curator`, `embedder`, and `memory_jobs` all `healthy`. HTTP 200 `degraded` means chat may work with reduced memory functionality. HTTP 503 `not_ready` means Ollama is unreachable. Compose health accepts valid degraded/not-ready reports, so `up --wait` can succeed before usable inference. `make ready` requires full readiness. The model endpoint is an allowlist, not proof that a model is installed or fits in memory.
 
+## Optional database GUI access
+
+Use `make up EXPOSE_DB=1` to enable PostgreSQL access for a host DBeaver or pgAdmin application. Pause clients and let in-flight work settle first; changing the port recreates PostgreSQL and interrupts connections. Stop its dependent writers before applying the change:
+
+```sh
+docker compose stop proxy worker
+make up EXPOSE_DB=1
+make ready
+```
+
+The command applies [compose.inspect.yaml](../compose.inspect.yaml) and verifies exactly `127.0.0.1:5433` → container `5432`. Chroma stays unpublished. To force recreation or select another free host port, use:
+
+```sh
+docker compose stop proxy worker
+make recreate EXPOSE_DB=1 POSTGRES_INSPECT_PORT=15433
+make ready
+```
+
+`POSTGRES_INSPECT_PORT` defaults to `5433` and accepts decimal ports from `1` to `65535`. `EXPOSE_DB` accepts `1` for inspection, or `0`/empty for private startup; an unqualified `make up` or `make recreate` uses the private default. Pass these options to each startup/recreation invocation that should retain inspection access.
+
+In DBeaver or pgAdmin, choose PostgreSQL, host `127.0.0.1`, port `5433` (or your chosen host port), and the initialized database's `POSTGRES_DB`, `POSTGRES_USER`, and password. Enter credentials privately. These fields assume a GUI running on the host; a pgAdmin container has its own loopback. Use read-only browsing and follow the [GUI runbook](operations-guide.md#optional-local-database-gui) for query guards and credential handling.
+
+When finished, disconnect the GUI, pause clients, and remove the publication with the normal base configuration:
+
+```sh
+docker compose stop proxy worker
+make recreate
+docker compose ps postgres
+make ready
+```
+
+Require no host mapping for PostgreSQL in the status output before resuming clients. `make recreate EXPOSE_DB=0` explicitly selects the same private mode. Named volumes and stored memory are preserved. Merely omitting `EXPOSE_DB` from a status command or running `make restart` does not remove an existing publication. If you exported `EXPOSE_DB=1` or manually included the inspection overlay in `COMPOSE_FILE`/`COMPOSE`, clear those overrides before removing access.
+
 ## Models, capacity, and runtime context
 
 The default installation pulls these exact IDs. To install or inspect them directly:
@@ -268,7 +302,7 @@ opencode
 opencode --model local-rag/qwen2.5-coder:7b
 ```
 
-From this checkout, launch a different existing coding repository:
+From this checkout, use the recommended hardened launcher for a different existing coding repository:
 
 ```sh
 make launch REPO=/path/to/repo
@@ -278,6 +312,18 @@ make launch REPO="/path/to/coding repo" MODEL=local-rag/qwen2.5-coder:7b
 `REPO` must exist and be readable; relative paths resolve from the local RAG checkout. The launcher opens that project's absolute path and loads this checkout's provider and memory plugin without copying files into the target. It defaults to this checkout's `opencode.json` model. `MODEL` accepts only `local-rag/<configured-model>`; other values fail. Keep this checkout available while using the launcher.
 
 The launcher supplies `OPENCODE_CONFIG`, `OPENCODE_CONFIG_DIR`, inline provider/plugin options, and `OPENCODE_PURE=0`. In verified OpenCode 1.18.30, the plugin replaces the entire `local-rag` provider after configuration merging, preventing target settings from redirecting this provider or changing its limits. Other target settings/providers still merge; check their permissions and instructions. See [OpenCode configuration precedence](https://opencode.ai/docs/config/#precedence-order). Normal coding activity can change target files according to OpenCode permissions; the launcher itself does not edit the target repository.
+
+For direct execution from the target repository, point OpenCode at this checkout's configuration and plugin directory with a portable path:
+
+```sh
+LOCAL_RAG_HOME=/path/to/local_dev_rag
+cd /path/to/repo
+OPENCODE_CONFIG="$LOCAL_RAG_HOME/opencode.json" \
+  OPENCODE_CONFIG_DIR="$LOCAL_RAG_HOME/.opencode" \
+  OPENCODE_PURE=0 opencode .
+```
+
+This direct form loads the provider and memory plugin but omits the launcher's inline post-merge provider snapshot. Target configuration can still merge or override settings, including the `local-rag` endpoint, model options, and limits. Inspect the resolved configuration privately if using this form; prefer `make launch` for its provider protections. Both forms require the local stack to be ready and this checkout to remain available.
 
 In the TUI, use `/models` to switch among the local selectors; `/new` starts a fresh session, `/sessions` selects a saved session, and `/compact` summarizes the current session. File references with `@` provide task-specific file context. These are OpenCode features described in its [TUI documentation](https://opencode.ai/docs/tui/). Select the `local-rag` provider to use this memory system; another provider bypasses the proxy.
 
@@ -298,7 +344,7 @@ make down
 make up
 ```
 
-`down` preserves named volumes. `restart` restarts existing containers; `recreate` rebuilds/reloads configuration and waits for Compose health. Do not use volume deletion or `make reset` as routine troubleshooting. Detailed backup and recovery procedures belong in the [operations guide](operations-guide.md).
+`down` preserves named volumes. `restart` restarts existing containers without changing ports; `recreate` rebuilds/reloads configuration and waits for Compose health. Add `EXPOSE_DB=1` to `up`/`recreate` when retaining GUI access; unqualified recreation removes it with the normal base configuration. Do not use volume deletion or `make reset` as routine troubleshooting. Detailed backup and recovery procedures belong in the [operations guide](operations-guide.md).
 
 ## Saved sessions, exports, and RAG memory
 
@@ -412,6 +458,7 @@ all checks pass but coding loops or becomes slow?
 | Missing executable or wrong Python | Follow `precheck` installation remedies. Install Python 3.12 yourself. Select existing tools with `make precheck PYTHON=/path/to/python3.12 OPENCODE=/path/to/opencode`; paths containing spaces must be quoted. `UV_PYTHON` can select uv's existing interpreter. Operator targets force `UV_PYTHON_DOWNLOADS=never`. |
 | Docker unavailable or startup failure | Start Docker Desktop/daemon; check `docker info`, `make status`, and `docker compose logs --tail=100 postgres chromadb proxy worker`. Fix the failing service rather than resetting volumes. |
 | Port 8080 occupied | An existing proxy is accepted only if liveness matches. Stop the identified conflicting service or change `.env` `PROXY_PORT` and OpenCode `baseURL` together; render, recreate, and rerun `precheck`. |
+| PostgreSQL GUI cannot connect / port 5433 occupied | Enable access with `make up EXPOSE_DB=1`, require the verified loopback mapping, and use initialized credentials. Choose a free port with `make recreate EXPOSE_DB=1 POSTGRES_INSPECT_PORT=15433` and update the GUI. Follow the [GUI runbook](operations-guide.md#optional-local-database-gui); restart alone does not change ports. |
 | Ready is `not_ready` / Ollama unreachable | Check `ollama list`, host listener/firewall, `OLLAMA_HOST`, and container `OLLAMA_URL`. Container loopback is not host loopback. Recreate after `.env` changes. |
 | Ready is `degraded` | Inspect which of six dependency names is unhealthy. PostgreSQL loss means untrimmed passthrough without durable-capture assurance; Chroma/embedder loss means no semantic recall. Restore dependencies and follow operator recovery procedures. |
 | Model listed but request fails | `/v1/models` is static. Run `ollama list`, pull the exact tagged ID, and test `ollama run qwen2.5-coder:7b 'Reply with OK.'`. Check model-specific memory/timeout errors. A ready report does not test foreground inference. |
