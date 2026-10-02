@@ -10,7 +10,13 @@ x-app: &app
     PROXY_HOST: 0.0.0.0
     # Container network bind is required; only the host loopback port is published.
     ALLOW_REMOTE_BIND: "true"
-    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-local_rag}:${POSTGRES_PASSWORD:-local_rag}@postgres:5432/${POSTGRES_DB:-local_rag}
+    # Settings safely encodes raw credentials; an explicit URL must be percent-encoded.
+    DATABASE_URL: ${DATABASE_URL:-}
+    POSTGRES_USER: ${POSTGRES_USER:-local_rag}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_rag}
+    POSTGRES_DB: ${POSTGRES_DB:-local_rag}
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
     CHROMADB_URL: http://chromadb:8000
     OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
   extra_hosts:

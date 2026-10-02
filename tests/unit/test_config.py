@@ -1,7 +1,17 @@
+import os
+
 import pytest
 from pydantic import ValidationError
 
 from local_dev_rag.config import Settings, get_settings
+
+
+@pytest.fixture(autouse=True)
+def clean_settings_environment(monkeypatch):
+    fields = {name.casefold() for name in Settings.model_fields}
+    for name in os.environ:
+        if name.casefold().split("__", 1)[0] in fields:
+            monkeypatch.delenv(name)
 
 
 def test_defaults_target_local_services_and_memory_models():

@@ -19,16 +19,17 @@ class Probe:
     def __init__(self, name, failure=None):
         self.name, self.failure = name, failure
 
-    async def health(self):
+    async def health(self, *, timeout_seconds=0.02):
         if self.failure == "timeout":
-            await asyncio.sleep(30)
+            async with asyncio.timeout(timeout_seconds):
+                await asyncio.sleep(30)
         if self.failure == "exception":
             raise RuntimeError("private prompt /Users/secret")
         if self.failure == "malformed":
             return {"state": "healthy"}
         return DependencyStatus(self.name, "unavailable" if self.failure else "healthy")
 
-    async def memory_health(self):
+    async def memory_health(self, *, timeout_seconds=0.02):
         return DependencyStatus("memory_jobs", "healthy")
 
 

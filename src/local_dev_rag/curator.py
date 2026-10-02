@@ -272,6 +272,111 @@ def _fact_terms(text: str) -> set[str]:
     }
 
 
+def _literal(text: str) -> str:
+    # Preserve order, roles, modifiers and negation. Only typography and English
+    # contractions are normalized; this is deliberately not bag-of-words entailment.
+    return " ".join(_normalize_negation(text).casefold().strip(" .!;\n").split())
+
+
+def _statements(excerpt: str) -> list[str]:
+    # Keep terminal punctuation: dropping '?' turns a question into evidence.
+    return [match[0] for match in re.finditer(r"[^.!?;\n]+(?:[.!?;\n]|$)", excerpt)]
+
+
+def _selection(text: str) -> tuple[set[str], str] | None:
+    """Closed selection paraphrases with the subject and its full local context."""
+    text = _literal(text)
+    active = re.fullmatch(
+        r"(?:(?:we|i|they|the team|the project)\s+)?"
+        r"(?:(?:have|has|had)\s+)?(?:(?:later|then)\s+)?"
+        r"(?:(?:decided|agreed) to (?:use|adopt|select|choose)|"
+        r"selected|chose|chosen|confirmed|will use|must use|use|choose)\s+(.+)",
+        text,
+    )
+    passive = re.fullmatch(
+        r"([\w.-]+) (?:was selected|is selected|were selected|will be used|is used)(.*)",
+        text,
+    )
+    nominal = re.fullmatch(r"([\w.-]+) is the selected (.+) (?:store|database|backend)", text)
+    fronted = re.fullmatch(r"(.+) will use ([\w.-]+)", text)
+    if active:
+        body = active[1]
+    elif passive:
+        body = passive[1] + passive[2]
+    elif nominal:
+        body = nominal[1] + " for " + nominal[2]
+    elif fronted:
+        body = fronted[2] + " for " + fronted[1]
+    else:
+        return None
+    body = re.sub(r"\s+as the best(?: available)? option(?= for |$)", "", body)
+    context = _CONTEXT.search(body)
+    subjects = body[: context.start()].strip() if context else body
+    parts = re.split(r"\s*(?:,\s*(?:and\s+)?|\band\b)\s*", subjects)
+    if not parts or not all(_NOMINAL.fullmatch(part) for part in parts):
+        return None
+    return set(parts), body[context.start() :] if context else ""
+
+
+def _relational_support(text: str, records: list[dict[str, object]]) -> bool:
+    """Require one supporting clause; never combine entities/purposes across facts."""
+    target = _literal(text)
+    selection = _selection(text)
+    for record in records:
+        for statement in _statements(_excerpt_text(cast(str, record["excerpt"]))):
+            statement = _normalize_negation(statement.strip())
+            if statement.endswith("?") or _CONDITION.search(statement):
+                continue
+            # This closed comparative form shares its trailing purpose with the
+            # selected subject. More complex comparison prose remains extractive.
+            statement = re.sub(
+                r"\s+(?:rather than|instead of)\s+[\w.-]+(?=\s+for\b)",
+                "",
+                statement,
+                flags=re.I,
+            )
+            inherited: Polarity | None = None
+            previous: set[str] = set()
+            frame = False
+            for clause in _evidence_clauses(statement.strip(".!;\n")):
+                if clause.casefold() in {"and", ","}:
+                    continue
+                if clause.casefold() in {
+                    "but",
+                    "while",
+                    "whereas",
+                    "however",
+                    "rather than",
+                    "instead of",
+                }:
+                    inherited, frame = None, False
+                    continue
+                status, subjects = _clause_evidence(clause, inherited, previous, frame)
+                uncertain = _SPECULATIVE.search(clause) or _UNCERTAIN.search(clause)
+                if not uncertain and status not in {"rejected", "unselected"}:
+                    if target == _literal(clause):
+                        return True
+                    if selection and status == "selected":
+                        support = _selection(clause.strip())
+                        # A coordinated infinitive inherits the already parsed
+                        # decision action, but never its subject or purpose.
+                        if support is None and frame:
+                            support = _selection(re.sub(r"^\s*to\s+", "", clause))
+                        if (
+                            support
+                            and selection[0] <= support[0]
+                            and (not selection[1] or selection[1] == support[1])
+                        ):
+                            return True
+                frame = bool(
+                    subjects
+                    and status in {"selected", "rejected"}
+                    and (frame or _FRAME.search(clause))
+                )
+                inherited, previous = status, subjects
+    return False
+
+
 def _option_evidence(
     records: list[dict[str, object]],
 ) -> tuple[set[str], set[str], list[set[str]]]:
@@ -279,12 +384,13 @@ def _option_evidence(
     facts: list[set[str]] = []
     for record in records:
         excerpt = _normalize_negation(_excerpt_text(cast(str, record["excerpt"])))
-        for statement in re.split(r"[.!?;\n]", excerpt):
+        for statement in _statements(excerpt):
             # A conditional statement contributes no selections or facts and
             # cannot revoke certain evidence from another statement. Apply this
             # before splitting clauses so no grammar path can discard its scope.
-            if _CONDITION.search(statement):
+            if statement.rstrip().endswith("?") or _CONDITION.search(statement):
                 continue
+            statement = statement.strip(" .!;\n")
             decision_frame = False
             inherited: Polarity | None = None
             previous: set[str] = set()
@@ -497,7 +603,8 @@ class Curator:
         if len(candidates) > self.max_memories:
             raise CuratorValidationError("Curator candidates exceed count budget")
         source_text = cast(str, cast(list[dict[str, object]], payload["messages"])[1]["content"])
-        selected_terms, excluded_terms, fact_terms = _option_evidence(json.loads(source_text))
+        records = json.loads(source_text)
+        selected_terms, excluded_terms, fact_terms = _option_evidence(records)
         drafts: list[MemoryDraft] = []
         seen: set[tuple[MemoryKind, str]] = set()
         for item in candidates:
@@ -534,6 +641,7 @@ class Curator:
                 or _FILLER.fullmatch(text)
                 or bool(terms & excluded_terms)
                 or not supported
+                or not _relational_support(text, records)
                 or key in seen
             ):
                 continue

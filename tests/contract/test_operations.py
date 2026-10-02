@@ -14,6 +14,39 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("explicit_url", [False, True])
+def test_compose_special_character_password_reaches_both_apps_intact(explicit_url):
+    from sqlalchemy.engine import make_url
+
+    from local_dev_rag.config import Settings
+
+    password = "synthetic@password:with/slash"
+    encoded = (
+        "postgresql+asyncpg://local_rag:synthetic%40password%3Awith%2Fslash@postgres:5432/local_rag"
+    )
+    config = json.loads(
+        subprocess.check_output(
+            ["docker", "compose", "--env-file", "/dev/null", "config", "--format", "json"],
+            cwd=ROOT,
+            env={
+                **os.environ,
+                "POSTGRES_PASSWORD": password,
+                "DATABASE_URL": encoded if explicit_url else "",
+            },
+        )
+    )
+    assert config["services"]["postgres"]["environment"]["POSTGRES_PASSWORD"] == password
+    for name in ("proxy", "worker"):
+        values = {
+            key.lower(): value for key, value in config["services"][name]["environment"].items()
+        }
+        settings = Settings(**values, _env_file=None)
+        url = make_url(settings.database_url)
+        assert url.password == password
+        assert url.host == "postgres" and url.username == "local_rag"
+        assert url.database == "local_rag"
+
+
 def test_worker_healthcheck_is_bounded_and_does_not_start_the_job_loop():
     try:
         result = subprocess.run(

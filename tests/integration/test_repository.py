@@ -250,6 +250,62 @@ async def test_session_context_rolls_back_failed_operation(database: Database):
         assert await session.scalar(text("SELECT count(*) FROM projects")) == 0
 
 
+async def test_abort_after_assistant_finalization_rolls_back_event_and_job(database):
+    async with database.session() as session:
+        scope = await ConversationRepository(session).ensure_scope(RequestIdentity("s", "p"))
+    with pytest.raises(RuntimeError, match="abort after finalization"):
+        async with database.session() as session:
+            await ConversationRepository(session).finalize_assistant(
+                scope,
+                AssistantCompletion(
+                    payload={"content": "done"}, content_hash="done", request_id="request"
+                ),
+            )
+            assert await session.scalar(text("SELECT count(*) FROM memory_jobs")) == 1
+            raise RuntimeError("abort after finalization")
+    async with database.session() as session:
+        assert await session.scalar(text("SELECT count(*) FROM conversation_events")) == 0
+        assert await session.scalar(text("SELECT count(*) FROM memory_jobs")) == 0
+
+
+@pytest.mark.parametrize(
+    "target", ["memory_event", "job_event", "supersession", "checkpoint_event", "checkpoint_memory"]
+)
+async def test_direct_sql_cannot_cross_project_memory_boundaries(database, target):
+    from .test_memory_dedup import persist
+    from .test_worker import seed
+
+    a, job_a = await seed(database, project="a")
+    b, job_b = await seed(database, project="b")
+    memory_a = (await persist(database, job_a))[0]
+    memory_b = (await persist(database, job_b))[0]
+    statements = {
+        "memory_event": "UPDATE memory_items SET source_session_id=:session_b, "
+        "source_event_id=:event_b WHERE id=:memory_a",
+        "job_event": "UPDATE memory_jobs SET session_id=:session_b, "
+        "source_event_id=:event_b WHERE id=:job_a",
+        "supersession": "UPDATE memory_items SET state='superseded', "
+        "superseded_by_id=:memory_b WHERE id=:memory_a",
+        "checkpoint_event": "UPDATE memory_sources SET source_session_id=:session_b, "
+        "source_event_id=:event_b WHERE memory_id=:memory_a",
+        "checkpoint_memory": "UPDATE memory_sources SET memory_id=:memory_b "
+        "WHERE memory_id=:memory_a",
+    }
+    with pytest.raises(IntegrityError):
+        async with database.session() as session:
+            await session.execute(
+                text(statements[target]),
+                {
+                    "session_b": b.session_id,
+                    "event_b": job_b.source_event_id,
+                    "job_a": job_a.id,
+                    "memory_a": memory_a.id,
+                    "memory_b": memory_b.id,
+                },
+            )
+    assert a.project_id != b.project_id
+
+
 async def test_cross_project_scope_cannot_insert_event(database: Database):
     from local_dev_rag.domain import Scope
 

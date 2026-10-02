@@ -16,8 +16,10 @@ class HealthProbe(Protocol):
     async def health(self) -> DependencyStatus: ...
 
 
-class DatabaseProbe(HealthProbe, Protocol):
-    async def memory_health(self) -> DependencyStatus: ...
+class DatabaseProbe(Protocol):
+    async def health(self, *, timeout_seconds: float) -> DependencyStatus: ...
+
+    async def memory_health(self, *, timeout_seconds: float) -> DependencyStatus: ...
 
 
 class RuntimeProbe(HealthProbe, Protocol):
@@ -52,7 +54,11 @@ class ReadinessService:
 
     async def _check(self, name: str, probe: Callable[[], Awaitable[object]]) -> DependencyStatus:
         try:
-            async with asyncio.timeout(self.timeout_seconds):
+            # Database probes own distinct operation/cleanup budgets themselves;
+            # cancelling around their cleanup recreates the session-exit failure.
+            async with asyncio.timeout(
+                None if name in {"postgres", "memory_jobs"} else self.timeout_seconds
+            ):
                 result = await probe()
             if (
                 not isinstance(result, DependencyStatus)
@@ -72,12 +78,14 @@ class ReadinessService:
 
     async def check(self) -> ReadinessReport:
         probes: dict[str, Callable[[], Awaitable[object]]] = {
-            "postgres": lambda: self.database.health(),
+            "postgres": lambda: self.database.health(timeout_seconds=self.timeout_seconds),
             "chromadb": lambda: self.vector_store.health(),
             "ollama": lambda: self.ollama.health(),
             "curator": lambda: self.ollama.model_health(self.settings.curator_model, "curator"),
             "embedder": lambda: self.ollama.model_health(self.settings.embedding_model, "embedder"),
-            "memory_jobs": lambda: self.database.memory_health(),
+            "memory_jobs": lambda: self.database.memory_health(
+                timeout_seconds=self.timeout_seconds
+            ),
         }
         results = await asyncio.gather(
             *(self._check(name, probe) for name, probe in probes.items())

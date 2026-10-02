@@ -17,6 +17,56 @@ from local_dev_rag.ollama import OllamaClient
 KINDS = ["requirement", "decision", "constraint", "preference", "error", "fix", "outcome"]
 
 
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    ("evidence", "text"),
+    [
+        ("Do we use Redis for caching?", "Use Redis for caching."),
+        ("We selected Redis for caching?", "Use Redis for caching."),
+        ("Redis replaced PostgreSQL.", "PostgreSQL replaced Redis."),
+        (
+            "We selected PostgreSQL for durable memory. We selected Redis for caching.",
+            "Use Redis for durable memory.",
+        ),
+        ("PostgreSQL fixed Redis.", "Redis fixed PostgreSQL."),
+        ("Redis is not used for caching.", "Redis is used for caching."),
+        ("We selected Redis for caching.", "Redis replaced caching."),
+        ("We selected Redis for caching.", "Use Redis because caching failed."),
+    ],
+)
+async def test_evidence_preserves_assertion_roles_and_local_context(kind, evidence, text):
+    instance = curator(
+        lambda request: response(json.dumps({"memories": [candidate(kind=kind, text=text)]}))
+    )
+    assert await instance.extract(source(evidence)) == []
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize(
+    ("evidence", "text"),
+    [
+        ("Redis replaced PostgreSQL.", "Redis replaced PostgreSQL."),
+        ("We selected Redis for caching.", "Redis was selected for caching."),
+        (
+            "We selected PostgreSQL for durable memory. We selected Redis for caching.",
+            "Use Redis for caching.",
+        ),
+        ("Do we use Redis? We selected PostgreSQL.", "Use PostgreSQL."),
+        ("Redis failed because port 6379 was busy.", "Redis failed because port 6379 was busy."),
+        ("Restarting Redis fixed the timeout.", "Restarting Redis fixed the timeout."),
+        (
+            "The Redis migration completed successfully.",
+            "The Redis migration completed successfully.",
+        ),
+    ],
+)
+async def test_bounded_relational_paraphrases_and_literal_facts(kind, evidence, text):
+    instance = curator(
+        lambda request: response(json.dumps({"memories": [candidate(kind=kind, text=text)]}))
+    )
+    assert await instance.extract(source(evidence)) == [MemoryDraft(kind, text, 0.9, 0.8)]
+
+
 def source(content="We decided to use PostgreSQL for durable memory."):
     project_id, session_id, event_id = uuid4(), uuid4(), uuid4()
     event = StoredEvent(
@@ -213,7 +263,7 @@ async def test_scope_mismatch_and_incomplete_source_are_rejected_before_calling_
     "evidence",
     [
         "Redis was not selected.",
-        "We decided to use PostgreSQL. Maybe use Redis for caching later.",
+        "We decided to use PostgreSQL for durable memory. Maybe use Redis for caching later.",
     ],
 )
 async def test_unselected_subject_is_omitted_even_beside_a_confirmed_decision(evidence):
@@ -639,8 +689,9 @@ async def test_confirmed_subjects_allow_bounded_declarative_paraphrases(text):
 @pytest.mark.parametrize(
     "evidence",
     [
-        "We selected PostgreSQL and may have selected Redis for durable memory.",
-        "We will use PostgreSQL and will use either Redis or MongoDB for caching.",
+        "We selected PostgreSQL for durable memory and may have selected Redis for caching.",
+        "We will use PostgreSQL for durable memory "
+        "and will use either Redis or MongoDB for caching.",
         "We decided to evaluate Redis and will use PostgreSQL for durable memory.",
         "We selected PostgreSQL, Redis and MongoDB for durable memory.",
     ],
@@ -715,7 +766,7 @@ async def test_every_kind_requires_grounding_for_every_content_subject(kind, tex
         (
             "requirement",
             "The project requires PostgreSQL to support transactional writes.",
-            "PostgreSQL requires support for transactional writes.",
+            "The project requires PostgreSQL to support transactional writes.",
         ),
         ("constraint", "Redis has a 256 MB limit.", "Redis has a 256 MB limit."),
         ("preference", "The team prefers Ruff for linting.", "The team prefers Ruff for linting."),
@@ -1374,6 +1425,5 @@ async def test_separate_unconditional_statements_remain_usable(
     )
     conditional = "If we rejected PostgreSQL but latency remains high, we use Redis"
     statements = [certain, conditional] if certain_first else [conditional, certain]
-    assert await instance.extract(source(separator.join(statements) + ".")) == [
-        MemoryDraft(kind, text, 0.9, 0.8)
-    ]
+    expected = [] if certain_first and separator == "? " else [MemoryDraft(kind, text, 0.9, 0.8)]
+    assert await instance.extract(source(separator.join(statements) + ".")) == expected

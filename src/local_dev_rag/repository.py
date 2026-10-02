@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, literal_column, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import SQLAlchemyError
@@ -26,7 +26,15 @@ from local_dev_rag.domain import (
     VectorHit,
 )
 from local_dev_rag.events import content_hash
-from local_dev_rag.schema import conversation_events, memory_items, memory_jobs, projects, sessions
+from local_dev_rag.schema import (
+    conversation_events,
+    memory_items,
+    memory_jobs,
+    memory_sources,
+    normalized_memory_text,
+    projects,
+    sessions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +68,20 @@ class MemoryRepository:
                     select(memory_items)
                     .where(
                         memory_items.c.project_id == source.project_id,
-                        memory_items.c.source_session_id == source.session_id,
-                        memory_items.c.source_event_id == source.source_event_id,
+                        or_(
+                            and_(
+                                memory_items.c.source_session_id == source.session_id,
+                                memory_items.c.source_event_id == source.source_event_id,
+                            ),
+                            select(memory_sources.c.memory_id)
+                            .where(
+                                memory_sources.c.memory_id == memory_items.c.id,
+                                memory_sources.c.project_id == source.project_id,
+                                memory_sources.c.source_session_id == source.session_id,
+                                memory_sources.c.source_event_id == source.source_event_id,
+                            )
+                            .exists(),
+                        ),
                     )
                     .order_by(memory_items.c.created_at, memory_items.c.id)
                 )
@@ -90,8 +110,9 @@ class MemoryRepository:
         existing = await self.for_source(source)
         if existing:
             return existing
-        for draft in drafts:
-            await self.session.execute(
+        # A consistent order avoids cross-job deadlocks on multiple canonical rows.
+        for draft in sorted(drafts, key=lambda item: " ".join(item.text.lower().split())):
+            memory_id = await self.session.scalar(
                 insert(memory_items)
                 .values(
                     id=uuid4(),
@@ -104,7 +125,27 @@ class MemoryRepository:
                     importance=draft.importance,
                     curator_model=curator_model,
                 )
-                .on_conflict_do_nothing(constraint="uq_memory_source_content")
+                .on_conflict_do_update(
+                    index_elements=[
+                        memory_items.c.project_id,
+                        normalized_memory_text(memory_items.c.text),
+                    ],
+                    index_where=memory_items.c.state == literal_column("'active'"),
+                    # Lock/return the canonical row without changing its provenance,
+                    # content, lifecycle, scores, or timestamps.
+                    set_={"id": memory_items.c.id},
+                )
+                .returning(memory_items.c.id)
+            )
+            await self.session.execute(
+                insert(memory_sources)
+                .values(
+                    project_id=source.project_id,
+                    source_session_id=source.session_id,
+                    source_event_id=source.source_event_id,
+                    memory_id=memory_id,
+                )
+                .on_conflict_do_nothing()
             )
         return await self.for_source(source)
 

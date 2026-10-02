@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from local_dev_rag.config import Settings
 from local_dev_rag.db import Database
 from local_dev_rag.domain import MemoryJob
-from local_dev_rag.schema import memory_items, memory_jobs
+from local_dev_rag.schema import memory_items, memory_jobs, memory_sources
 
 
 def _compact_error(error: object) -> tuple[str, str]:
@@ -151,8 +151,20 @@ class JobRepository:
                             select(memory_items.c.id).where(
                                 memory_items.c.id.in_(unique_ids),
                                 memory_items.c.project_id == row["project_id"],
-                                memory_items.c.source_session_id == row["session_id"],
-                                memory_items.c.source_event_id == row["source_event_id"],
+                                or_(
+                                    and_(
+                                        memory_items.c.source_session_id == row["session_id"],
+                                        memory_items.c.source_event_id == row["source_event_id"],
+                                    ),
+                                    select(memory_sources.c.memory_id)
+                                    .where(
+                                        memory_sources.c.memory_id == memory_items.c.id,
+                                        memory_sources.c.project_id == row["project_id"],
+                                        memory_sources.c.source_session_id == row["session_id"],
+                                        memory_sources.c.source_event_id == row["source_event_id"],
+                                    )
+                                    .exists(),
+                                ),
                                 memory_items.c.state == "active",
                             )
                         )

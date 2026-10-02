@@ -111,6 +111,53 @@ memory_items = sa.Table(
     sa.Index("ix_memory_project_state", "project_id", "state"),
     sa.Index("ix_memory_source_event", "source_event_id"),
 )
+
+
+def normalized_memory_text(value: object):
+    """The same PostgreSQL expression defines identity and its unique index."""
+    # Constants must remain SQL literals for PostgreSQL prepared-plan index
+    # inference; bind parameters cannot identify an expression/partial index.
+    return sa.func.lower(
+        sa.func.btrim(
+            sa.func.regexp_replace(
+                value,
+                sa.literal_column(r"'\s+'"),
+                sa.literal_column("' '"),
+                sa.literal_column("'g'"),
+            )
+        )
+    )
+
+
+sa.Index(
+    "uq_memory_active_text",
+    memory_items.c.project_id,
+    normalized_memory_text(memory_items.c.text),
+    unique=True,
+    postgresql_where=memory_items.c.state == "active",
+)
+
+# Checkpoints keep every source even when another source supplied the canonical row.
+memory_sources = sa.Table(
+    "memory_sources",
+    metadata,
+    sa.Column("project_id", UUID(as_uuid=True), nullable=False),
+    sa.Column("source_session_id", UUID(as_uuid=True), nullable=False),
+    sa.Column("source_event_id", UUID(as_uuid=True), primary_key=True),
+    sa.Column("memory_id", UUID(as_uuid=True), primary_key=True),
+    sa.ForeignKeyConstraint(
+        ["project_id", "source_session_id", "source_event_id"],
+        [
+            "conversation_events.project_id",
+            "conversation_events.session_id",
+            "conversation_events.id",
+        ],
+    ),
+    sa.ForeignKeyConstraint(
+        ["project_id", "memory_id"], ["memory_items.project_id", "memory_items.id"]
+    ),
+)
+
 memory_jobs = sa.Table(
     "memory_jobs",
     metadata,

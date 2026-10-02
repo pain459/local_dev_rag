@@ -1,5 +1,6 @@
 """Operational states through PostgreSQL and the real foreground/worker adapters."""
 
+import asyncio
 import io
 import json
 import logging
@@ -21,6 +22,78 @@ from local_dev_rag.vector_store import VectorStore
 from .test_foreground_flow import RESULT, SSE, deliver, payload, settings
 from .test_jobs import row
 from .test_worker import seed, worker
+
+
+@pytest.mark.parametrize("stall_query", [False, True])
+async def test_readyz_bounds_real_sqlalchemy_stalled_rollback_without_orphan_tasks(
+    database, monkeypatch, stall_query
+):
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.util import await_only
+
+    from local_dev_rag.domain import DependencyStatus
+    from local_dev_rag.readiness import ReadinessService
+
+    class Healthy:
+        def __init__(self, name):
+            self.name = name
+
+        async def health(self):
+            return DependencyStatus(self.name, "healthy")
+
+        async def model_health(self, model, name):
+            return DependencyStatus(name, "healthy")
+
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    rollback = database.engine.sync_engine.dialect.do_rollback
+    execute = AsyncSession.execute
+
+    async def stalled_execute(self, *args, **kwargs):
+        result = await execute(self, *args, **kwargs)
+        if stall_query:
+            await gate.wait()
+        return result
+
+    monkeypatch.setattr(AsyncSession, "execute", stalled_execute)
+
+    def stalled_rollback(connection):
+        entered.set()
+        await_only(gate.wait())
+        rollback(connection)
+
+    monkeypatch.setattr(database.engine.sync_engine.dialect, "do_rollback", stalled_rollback)
+    checker = ReadinessService(
+        Settings(_env_file=None),
+        database=database,
+        vector_store=Healthy("chromadb"),
+        ollama=Healthy("ollama"),
+        timeout_seconds=0.02,
+    )
+    app = create_app(Settings(_env_file=None), database=database, readiness_service=checker)
+    before = asyncio.all_tasks()
+    factory = asyncio.get_running_loop().get_task_factory()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://proxy"
+    ) as client:
+        task = asyncio.create_task(client.get("/readyz"))
+        try:
+            done, _ = await asyncio.wait({task}, timeout=0.5)
+            assert entered.is_set(), "The real SQLAlchemy rollback was not exercised"
+            assert task in done, "readyz exceeded the independently bounded cleanup deadline"
+            response = task.result()
+            assert response.status_code == 200
+            assert response.json()["status"] == "degraded"
+            assert response.json()["dependencies"]["postgres"] == "unavailable"
+            assert asyncio.get_running_loop().get_task_factory() is factory
+            assert not (asyncio.all_tasks() - before - {asyncio.current_task()})
+            assert database.engine.pool.checkedout() == 0
+        finally:
+            gate.set()
+            await asyncio.wait_for(task, 2)
+    monkeypatch.undo()
+    # Pool remains usable for foreground ownership after the health failure.
+    assert (await database.health()).state == "healthy"
 
 
 async def test_database_and_real_chroma_health(database, chroma_url):

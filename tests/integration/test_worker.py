@@ -20,6 +20,13 @@ from local_dev_rag.vector_store import VectorStore
 from .test_jobs import ready, row
 
 KINDS = ["requirement", "decision", "constraint", "preference", "outcome"]
+FACTS = {
+    "requirement": "The project requires transactional writes.",
+    "decision": "Use PostgreSQL for durable memory.",
+    "constraint": "Redis has a 256 MB limit.",
+    "preference": "The team prefers Ruff for linting.",
+    "outcome": "The PostgreSQL migration completed successfully.",
+}
 
 
 async def seed(database, *, project="project", session_id="session"):
@@ -29,7 +36,10 @@ async def seed(database, *, project="project", session_id="session"):
         event = await repository.finalize_assistant(
             scope,
             AssistantCompletion(
-                payload={"content": "We selected PostgreSQL for durable memory."},
+                payload={
+                    "content": "We selected PostgreSQL for durable memory. "
+                    + " ".join(text for kind, text in FACTS.items() if kind != "decision")
+                },
                 content_hash=str(uuid4()),
                 request_id=str(uuid4()),
             ),
@@ -50,7 +60,7 @@ def envelope(kinds=KINDS):
                             "memories": [
                                 {
                                     "kind": kind,
-                                    "text": "Use PostgreSQL for durable memory.",
+                                    "text": FACTS[kind],
                                     "confidence": 0.9,
                                     "importance": 0.8,
                                 }

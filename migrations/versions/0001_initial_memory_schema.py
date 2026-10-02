@@ -176,6 +176,33 @@ def upgrade() -> None:
         "ix_memory_project_state", "memory_items", ["project_id", "state"], unique=False
     )
     op.create_index("ix_memory_source_event", "memory_items", ["source_event_id"], unique=False)
+    op.create_index(
+        "uq_memory_active_text",
+        "memory_items",
+        ["project_id", sa.text(r"lower(btrim(regexp_replace(text, '\s+', ' ', 'g')))")],
+        unique=True,
+        postgresql_where=sa.text("state = 'active'"),
+    )
+    op.create_table(
+        "memory_sources",
+        sa.Column("project_id", sa.UUID(), nullable=False),
+        sa.Column("source_session_id", sa.UUID(), nullable=False),
+        sa.Column("source_event_id", sa.UUID(), nullable=False),
+        sa.Column("memory_id", sa.UUID(), nullable=False),
+        sa.PrimaryKeyConstraint("source_event_id", "memory_id"),
+        sa.ForeignKeyConstraint(
+            ["project_id", "source_session_id", "source_event_id"],
+            [
+                "conversation_events.project_id",
+                "conversation_events.session_id",
+                "conversation_events.id",
+            ],
+        ),
+        sa.ForeignKeyConstraint(
+            ["project_id", "memory_id"],
+            ["memory_items.project_id", "memory_items.id"],
+        ),
+    )
     op.create_table(
         "memory_jobs",
         sa.Column("id", sa.UUID(), nullable=False),
@@ -243,6 +270,8 @@ def downgrade() -> None:
     op.drop_index("ix_job_ready", table_name="memory_jobs")
     op.drop_index("ix_job_lease", table_name="memory_jobs")
     op.drop_table("memory_jobs")
+    op.drop_table("memory_sources")
+    op.drop_index("uq_memory_active_text", table_name="memory_items")
     op.drop_index("ix_memory_source_event", table_name="memory_items")
     op.drop_index("ix_memory_project_state", table_name="memory_items")
     op.drop_table("memory_items")

@@ -5,6 +5,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 
 class ModelBudget(BaseModel):
@@ -63,7 +64,12 @@ class Settings(BaseSettings):
     allow_remote_bind: bool = False
     ollama_url: str = "http://host.docker.internal:11434"
     chromadb_url: str = "http://chromadb:8000"
-    database_url: str = "postgresql+asyncpg://local_rag:local_rag@postgres:5432/local_rag"
+    database_url: str = ""
+    postgres_user: str = "local_rag"
+    postgres_password: str = "local_rag"
+    postgres_db: str = "local_rag"
+    postgres_host: str = "postgres"
+    postgres_port: int = Field(default=5432, ge=1, le=65535)
     default_model: str = "qwen3-coder:30b"
     curator_model: str = "qwen2.5-coder:1.5b"
     embedding_model: str = "nomic-embed-text:latest"
@@ -93,6 +99,19 @@ class Settings(BaseSettings):
             loopback = self.proxy_host == "localhost"
         if not loopback and not self.allow_remote_bind:
             raise ValueError("Non-loopback PROXY_HOST requires ALLOW_REMOTE_BIND=true")
+        return self
+
+    @model_validator(mode="after")
+    def construct_database_url(self) -> Self:
+        if not self.database_url:
+            self.database_url = URL.create(
+                "postgresql+asyncpg",
+                username=self.postgres_user,
+                password=self.postgres_password,
+                host=self.postgres_host,
+                port=self.postgres_port,
+                database=self.postgres_db,
+            ).render_as_string(hide_password=False)
         return self
 
 
