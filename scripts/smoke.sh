@@ -6,9 +6,11 @@ CDPATH= cd "$script_dir/.."
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 docker_cli=${DOCKER:-docker}
-compose_command=${COMPOSE:-"$docker_cli compose"}
+compose_command=${COMPOSE:-}
 # Match the Makefile operator command overrides, without evaluating shell syntax.
-smoke_compose() { (set -f; $compose_command "$@"); }
+smoke_compose() {
+    if [ -n "$compose_command" ]; then (set -f; $compose_command "$@"); else "$docker_cli" compose "$@"; fi
+}
 command -v "$docker_cli" >/dev/null 2>&1 || fail "Install Docker with the Compose plugin, then rerun ./scripts/smoke.sh."
 "$docker_cli" info >/dev/null 2>&1 || fail "Start Docker Desktop or the Docker daemon; verify docker info."
 smoke_compose version >/dev/null 2>&1 || fail "Install Docker Compose v2+; verify docker compose version."

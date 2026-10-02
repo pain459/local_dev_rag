@@ -1,7 +1,7 @@
 #!/bin/sh
 # Sourced by the focused operator scripts. Never source .env or eval config.
 DOCKER=${DOCKER:-docker}
-COMPOSE=${COMPOSE:-"$DOCKER compose"}
+COMPOSE=${COMPOSE:-}
 UV=${UV:-uv}
 PYTHON=${PYTHON:-python3.12}
 NODE=${NODE:-node}
@@ -9,18 +9,44 @@ OLLAMA=${OLLAMA:-ollama}
 OPENCODE=${OPENCODE:-opencode}
 operator_dir=${0%/*}
 probe=$operator_dir/operator-probe.py
+runner=$operator_dir/operator-run.py
+DIAGNOSTIC_TIMEOUT_SECONDS=${DIAGNOSTIC_TIMEOUT_SECONDS:-15}
+COMPOSE_TIMEOUT_SECONDS=${COMPOSE_TIMEOUT_SECONDS:-300}
+STARTUP_TIMEOUT_SECONDS=${STARTUP_TIMEOUT_SECONDS:-120}
+DOWNLOAD_TIMEOUT_SECONDS=${DOWNLOAD_TIMEOUT_SECONDS:-3600}
+# A functioning Python runtime supervises even a broken/hanging PYTHON override.
+runner_python=$(command -v python3 || command -v python3.12 || command -v "$PYTHON") || {
+    printf '%s\n' 'FAIL: Python runtime missing. Install Python 3.12 (including python3) before using operator commands.' >&2
+    exit 1
+}
 problems=0
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; }
 issue() { fail "$1"; problems=1; }
 pass() { printf 'PASS: %s\n' "$1"; }
-# COMPOSE is an operator command plus arguments; split words, never eval syntax.
-compose() { (set -f; $COMPOSE "$@"); }
-render() { compose config --format json 2>/dev/null; }
-inspect_config() { printf '%s\n' "$config" | "$PYTHON" "$probe" "$1"; }
+run_deadline() { "$runner_python" "$runner" "$@"; }
+run_probe() { run_deadline "$DIAGNOSTIC_TIMEOUT_SECONDS" "$@"; }
+# The default preserves DOCKER as one executable even when its path has spaces.
+# Explicit COMPOSE is a command plus words, never evaluated shell syntax.
+compose_with_timeout() {
+    deadline=$1
+    shift
+    if [ -n "$COMPOSE" ]; then
+        (set -f; run_deadline "$deadline" $COMPOSE "$@")
+    else
+        run_deadline "$deadline" "$DOCKER" compose "$@"
+    fi
+}
+compose() { compose_with_timeout "$COMPOSE_TIMEOUT_SECONDS" "$@"; }
+compose_probe() { compose_with_timeout "$DIAGNOSTIC_TIMEOUT_SECONDS" "$@"; }
+compose_follow() {
+    if [ -n "$COMPOSE" ]; then (set -f; $COMPOSE "$@"); else "$DOCKER" compose "$@"; fi
+}
+render() { compose_probe config --format json 2>/dev/null; }
+inspect_config() { printf '%s\n' "$config" | run_probe "$PYTHON" "$probe" "$1"; }
 
 host_checks() {
-    platform=$(uname -s)
+    platform=$(run_probe uname -s) || { issue 'Platform detection failed or timed out. Check uname and DIAGNOSTIC_TIMEOUT_SECONDS.'; return 1; }
     case "$platform" in
         Darwin) platform_name=macOS; docker_remedy='Install Docker Desktop for Mac (https://docs.docker.com/desktop/setup/install/mac-install/).';;
         Linux) platform_name=Linux; docker_remedy='Install Docker Engine and the Compose plugin for your distribution (https://docs.docker.com/engine/install/).';;
@@ -39,7 +65,7 @@ host_checks() {
             issue "$platform_name: missing $tool. $remedy"
             continue
         fi
-        version=$("$tool" --version 2>/dev/null) || { issue "$tool --version failed. Repair/select your $platform_name installation."; continue; }
+        version=$(run_probe "$tool" --version 2>/dev/null) || { issue "$tool --version failed or timed out. Repair/select your $platform_name installation; check DIAGNOSTIC_TIMEOUT_SECONDS."; continue; }
         # Host tools print their own public version; never print config/debug output.
         pass "$tool: $version"
         if [ "$tool" = "$PYTHON" ]; then
@@ -47,8 +73,8 @@ host_checks() {
         fi
     done
     if command -v "$DOCKER" >/dev/null 2>&1; then
-        "$DOCKER" info >/dev/null 2>&1 || issue "Docker daemon unavailable. On $platform_name start Docker Desktop/the Docker daemon; verify docker info."
-        if compose_version=$(compose version 2>/dev/null); then
+        run_probe "$DOCKER" info >/dev/null 2>&1 || issue "Docker daemon unavailable or timed out. On $platform_name start Docker Desktop/the Docker daemon; verify docker info."
+        if compose_version=$(compose_probe version 2>/dev/null); then
             pass "$compose_version"
         else
             issue "$platform_name: Docker Compose unavailable. $docker_remedy Verify docker compose version."

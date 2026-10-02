@@ -1,8 +1,9 @@
 # Thin command surface; reusable checks and safeguards live under scripts/.
-SHELL := /bin/sh
+override SHELL := /bin/sh
 .DEFAULT_GOAL := help
 DOCKER ?= docker
-COMPOSE ?= $(DOCKER) compose
+# Empty COMPOSE selects the distinct, quoted DOCKER executable + compose argument.
+COMPOSE ?=
 COMPOSE_FILE ?= compose.yaml
 UV ?= uv
 PYTHON ?= python3.12
@@ -10,8 +11,22 @@ NODE ?= node
 OLLAMA ?= ollama
 OPENCODE ?= opencode
 LOG_TAIL ?= 100
+DIAGNOSTIC_TIMEOUT_SECONDS ?= 15
+COMPOSE_TIMEOUT_SECONDS ?= 300
+STARTUP_TIMEOUT_SECONDS ?= 120
+DOWNLOAD_TIMEOUT_SECONDS ?= 3600
+# Capture user values once, literally, before export can expand Make expressions.
+# Defer $(value ...) through eval's first pass; := performs its sole expansion.
+# Internal defaults remain deliberate Make expressions. Keep Make's own control
+# metadata intact so its command-line precedence and recursive invocations work.
+# Protect the capture machinery itself from user overrides/iterator collisions.
+override operator_literal_iterator := $(value operator_literal_iterator)
+export operator_literal_iterator
+override operator_user_variables := $(filter-out MAKEFLAGS MAKEOVERRIDES MFLAGS MAKELEVEL GNUMAKEFLAGS,$(.VARIABLES))
+$(foreach operator_literal_iterator,$(operator_user_variables),$(if $(filter command line environment,$(origin $(operator_literal_iterator))),$(eval override $(operator_literal_iterator) := $$(value $(operator_literal_iterator)))$(eval export $(operator_literal_iterator))))
 export DOCKER COMPOSE COMPOSE_FILE UV PYTHON NODE OLLAMA OPENCODE LOG_TAIL
 export PROJECT CONFIRM
+export DIAGNOSTIC_TIMEOUT_SECONDS COMPOSE_TIMEOUT_SECONDS STARTUP_TIMEOUT_SECONDS DOWNLOAD_TIMEOUT_SECONDS
 
 .PHONY: help precheck essentials doctor doctor-fix up down restart recreate status logs ready migrate reindex smoke test check reset
 help:
@@ -37,7 +52,9 @@ help:
 	  'Safety: never installs host tools; never overwrites .env or credentials.' \
 	  'doctor is read-only; doctor-fix downloads/builds without starting services.' \
 	  'reset preserves .env, host Ollama models, and Docker images. Back up first.' \
-	  'Overrides: COMPOSE_PROJECT_NAME, COMPOSE_FILE, COMPOSE, DOCKER, UV, PYTHON, NODE, OLLAMA, OPENCODE.'
+	  'Overrides: COMPOSE_PROJECT_NAME, COMPOSE_FILE, COMPOSE, DOCKER, UV, PYTHON, NODE, OLLAMA, OPENCODE.' \
+	  'Deadlines (seconds): DIAGNOSTIC_TIMEOUT_SECONDS=15, COMPOSE_TIMEOUT_SECONDS=300,' \
+	  '  STARTUP_TIMEOUT_SECONDS=120, DOWNLOAD_TIMEOUT_SECONDS=3600; logs --follow is unbounded.'
 
 precheck:
 	@/bin/sh scripts/precheck.sh
@@ -55,11 +72,11 @@ ready:
 reset:
 	@/bin/sh scripts/reset.sh
 smoke:
-	@/bin/sh scripts/smoke.sh
+	@/bin/sh scripts/operator-stack.sh smoke
 test:
-	@"$(UV)" run pytest
+	@"$$UV" run pytest
 check:
-	@"$(UV)" run ruff check .
-	@"$(UV)" run pyright
-	@"$(UV)" run pytest
+	@"$$UV" run ruff check .
+	@"$$UV" run pyright
+	@"$$UV" run pytest
 	@/bin/sh scripts/operator-stack.sh config

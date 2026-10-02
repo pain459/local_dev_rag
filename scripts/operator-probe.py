@@ -174,6 +174,10 @@ def main():
                     r"[A-Za-z0-9][A-Za-z0-9_.:/-]*", value
                 ):
                     return failure(f"Invalid {key}. Set a valid Ollama model ID in .env.")
+                if not re.fullmatch(r"[^:]+:[A-Za-z0-9_.-]+", value):
+                    return failure(
+                        f"Invalid {key}. Require an explicit Ollama tag, e.g. model:latest."
+                    )
                 if value not in models:
                     models.append(value)
             if mode == "models":

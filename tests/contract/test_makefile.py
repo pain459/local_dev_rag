@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -20,13 +21,19 @@ MODELS = [
 ]
 
 FAKE = r"""
-import json, os, pathlib, subprocess, sys
+import json, os, pathlib, signal, subprocess, sys, time
 name, args = pathlib.Path(sys.argv[0]).name, sys.argv[1:]
 with open(os.environ["TOOL_LOG"], "a") as log:
     log.write(json.dumps([name, *args]) + "\n")
 if name == "docker" and args and args[0] == "compose":
     with open(os.environ["PROJECT_LOG"], "a") as log:
         log.write(os.environ.get("COMPOSE_PROJECT_NAME", "") + "\n")
+if os.environ.get("HANG_CALL") == json.dumps([name, *args]):
+    child = subprocess.Popen([sys.executable, "-c",
+        "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)"])
+    pathlib.Path(os.environ["CHILD_PID"]).write_text(str(child.pid))
+    pathlib.Path(os.environ["PARENT_PID"]).write_text(str(os.getpid()))
+    time.sleep(60)
 if name == "python3.12":
     if args == ["--version"]:
         print(os.environ.get("PYTHON_VERSION", "Python 3.12.9"))
@@ -114,6 +121,7 @@ def operator(tmp_path):
         executable = shutil.which(utility)
         assert executable is not None
         (bin_dir / utility).symlink_to(executable)
+    (bin_dir / "python3").symlink_to(sys.executable)
     for name in [
         "docker",
         "ollama",
@@ -137,6 +145,8 @@ def operator(tmp_path):
         "PATH": str(bin_dir),
         "TOOL_LOG": str(tmp_path / "tools.jsonl"),
         "PROJECT_LOG": str(tmp_path / "projects.log"),
+        "CHILD_PID": str(tmp_path / "child.pid"),
+        "PARENT_PID": str(tmp_path / "parent.pid"),
         "INSTALLED": json.dumps(MODELS),
         "COMPOSE_CONFIG": json.dumps(
             {
@@ -178,13 +188,14 @@ def operator(tmp_path):
         root = tmp_path
 
         def run(self, target, *variables, **overrides):
+            test_timeout = overrides.pop("test_timeout", 30)
             return subprocess.run(
                 ["/usr/bin/make", target, *variables],
                 cwd=tmp_path,
                 env={**env, **overrides},
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=test_timeout,
                 stdin=subprocess.DEVNULL,
             )
 
@@ -199,6 +210,36 @@ def operator(tmp_path):
 
         def rename(self, name, new_name):
             (bin_dir / name).rename(bin_dir / new_name)
+
+        def spaced_tool(self, name):
+            directory = tmp_path / "space in path"
+            directory.mkdir(exist_ok=True)
+            tool = directory / name
+            shutil.copy(bin_dir / name, tool)
+            return str(tool)
+
+        def assert_child_stopped(self):
+            pid = int((tmp_path / "child.pid").read_text())
+            for _ in range(30):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return
+                # Linux may briefly retain an init-owned terminated child as a zombie.
+                stat = Path(f"/proc/{pid}/stat")
+                if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                    return
+                time.sleep(0.05)
+            raise AssertionError(f"Child {pid} survived deadline cleanup")
+
+        def cleanup_fake_processes(self):
+            for name in ["child.pid", "parent.pid"]:
+                pid = tmp_path / name
+                if pid.exists():
+                    try:
+                        os.kill(int(pid.read_text()), 9)
+                    except ProcessLookupError:
+                        pass
 
         def config(self, **values):
             config = json.loads(env["COMPOSE_CONFIG"])
@@ -365,10 +406,13 @@ def test_doctor_fix_pulls_only_missing_models_then_diagnoses_without_startup(ope
 @pytest.mark.parametrize(
     ("target", "args"),
     [
-        ("up", ["up", "-d", "--wait"]),
+        ("up", ["up", "-d", "--wait", "--wait-timeout", "120"]),
         ("down", ["down"]),
         ("restart", ["restart"]),
-        ("recreate", ["up", "--build", "--force-recreate", "-d", "--wait"]),
+        (
+            "recreate",
+            ["up", "--build", "--force-recreate", "-d", "--wait", "--wait-timeout", "120"],
+        ),
         ("status", ["ps"]),
         ("logs", ["logs", "--tail", "100", "--follow"]),
         ("migrate", ["exec", "-T", "proxy", "alembic", "upgrade", "head"]),
@@ -480,7 +524,17 @@ def test_reset_interactive_requires_exact_word(operator, confirmation):
 
 def test_command_override_passes_arguments_without_evaluating_shell(operator):
     successful(operator.run("up", "COMPOSE=docker compose --ansi never"))
-    assert ["docker", "compose", "--ansi", "never", "up", "-d", "--wait"] in operator.calls()
+    assert [
+        "docker",
+        "compose",
+        "--ansi",
+        "never",
+        "up",
+        "-d",
+        "--wait",
+        "--wait-timeout",
+        "120",
+    ] in operator.calls()
     result = operator.run("up", "COMPOSE=docker compose ; touch injected")
     successful(result)  # Literal arguments, never shell syntax.
     assert not (operator.root / "injected").exists()
@@ -576,3 +630,226 @@ def test_smoke_honors_docker_and_compose_overrides(operator):
     assert ["chosen-docker", "info"] in operator.calls()
     assert ["chosen-docker", "compose", "config", "--quiet"] in operator.calls()
     assert any(call[:4] == ["chosen-docker", "compose", "exec", "-T"] for call in operator.calls())
+
+
+@pytest.mark.parametrize(
+    "variable",
+    [
+        "PROJECT",
+        "CONFIRM",
+        "COMPOSE_PROJECT_NAME",
+        "COMPOSE_FILE",
+        "LOG_TAIL",
+        "DOCKER",
+        "COMPOSE",
+        "UV",
+        "PYTHON",
+        "NODE",
+        "OLLAMA",
+        "OPENCODE",
+        "OLLAMA_HOST",
+        "DIAGNOSTIC_TIMEOUT_SECONDS",
+        "COMPOSE_TIMEOUT_SECONDS",
+        "STARTUP_TIMEOUT_SECONDS",
+        "DOWNLOAD_TIMEOUT_SECONDS",
+        "SMOKE_MODEL",
+        "SMOKE_TIMEOUT_SECONDS",
+        "CUSTOM_OPAQUE",
+        "name",
+        "operator_user_variables",
+        "operator_literal_iterator",
+    ],
+)
+def test_make_function_overrides_are_never_evaluated(operator, variable):
+    result = operator.run(
+        "help",
+        variable + "=$(shell printf OPERATOR_REVIEW_SENTINEL >&2)",
+    )
+    successful(result)
+    assert "OPERATOR_REVIEW_SENTINEL" not in result.stdout + result.stderr
+
+
+def test_project_make_expression_is_rejected_literally_before_io(operator):
+    result = operator.run(
+        "reindex",
+        "PROJECT=$(shell printf OPERATOR_REVIEW_SENTINEL >&2)",
+        "COMPOSE=/usr/bin/false",
+    )
+    assert result.returncode != 0
+    assert "OPERATOR_REVIEW_SENTINEL" not in result.stdout + result.stderr
+    assert not operator.calls()
+
+
+@pytest.mark.parametrize(
+    "confirmation",
+    [
+        "$(shell printf OPERATOR_REVIEW_SENTINEL >&2; printf RESET)",
+        "$$RESET",
+        "$RESET",
+    ],
+)
+def test_reset_does_not_expand_confirmation_into_authorization(operator, confirmation):
+    result = operator.run("reset", "CONFIRM=" + confirmation, RESET="RESET")
+    assert result.returncode != 0
+    assert "OPERATOR_REVIEW_SENTINEL" not in result.stdout + result.stderr
+    assert not mutations(operator)
+
+
+def test_data_dollar_signs_survive_to_command_boundary(operator):
+    successful(operator.run("logs", "LOG_TAIL=$$KEEP_$literal"))
+    assert [
+        "docker",
+        "compose",
+        "logs",
+        "--tail",
+        "$$KEEP_$literal",
+        "--follow",
+    ] in operator.calls()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        'uv"; printf OPERATOR_UV_SENTINEL; #',
+        "uv$(printf OPERATOR_UV_SENTINEL)",
+        "uv`printf OPERATOR_UV_SENTINEL`",
+    ],
+)
+def test_uv_override_is_executable_data_not_recipe_source(operator, value):
+    result = operator.run("test", "UV=" + value)
+    assert result.returncode != 0
+    assert not operator.calls()
+    assert "\nOPERATOR_UV_SENTINEL" not in result.stdout + result.stderr
+    dry = operator.run("-n", "test", "UV=" + value)
+    successful(dry)
+    assert value not in dry.stdout
+
+
+def test_uv_executable_path_with_spaces_is_preserved(operator):
+    successful(operator.run("test", "UV=" + operator.spaced_tool("uv")))
+    assert ["uv", "run", "pytest"] in operator.calls()
+
+
+def test_default_compose_preserves_docker_executable_path_with_spaces(operator):
+    successful(operator.run("status", "DOCKER=" + operator.spaced_tool("docker")))
+    assert ["docker", "compose", "ps"] in operator.calls()
+
+
+def test_smoke_default_compose_preserves_docker_path_with_spaces(operator):
+    successful(operator.run("smoke", "DOCKER=" + operator.spaced_tool("docker")))
+    assert ["docker", "compose", "config", "--quiet"] in operator.calls()
+
+
+@pytest.mark.parametrize(
+    ("target", "call"),
+    [
+        ("precheck", ["uname", "-s"]),
+        ("precheck", ["node", "--version"]),
+        ("precheck", ["python3.12", "--version"]),
+        ("precheck", ["docker", "info"]),
+        ("doctor", ["docker", "compose", "config", "--format", "json"]),
+        ("doctor", ["opencode", "debug", "config"]),
+        ("doctor", ["opencode", "models", "local-rag"]),
+        (
+            "doctor",
+            [
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "worker",
+                "python",
+                "-m",
+                "local_dev_rag.worker",
+                "--healthcheck",
+            ],
+        ),
+        ("migrate", ["docker", "compose", "exec", "-T", "proxy", "alembic", "upgrade", "head"]),
+    ],
+)
+def test_hanging_subprocesses_fail_with_deadline_and_kill_descendants(operator, target, call):
+    started = time.monotonic()
+    try:
+        try:
+            result = operator.run(
+                target,
+                "DIAGNOSTIC_TIMEOUT_SECONDS=1",
+                "COMPOSE_TIMEOUT_SECONDS=1",
+                HANG_CALL=json.dumps(call),
+                test_timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail("Operator subprocess exceeded its configured outer deadline")
+        assert result.returncode != 0
+        assert time.monotonic() - started < 5
+        operator.assert_child_stopped()
+    finally:
+        operator.cleanup_fake_processes()
+
+
+@pytest.mark.parametrize("target", ["up", "recreate"])
+def test_startup_wait_has_configured_inner_and_outer_bound(operator, target):
+    successful(operator.run(target, "STARTUP_TIMEOUT_SECONDS=17"))
+    assert any(call[-2:] == ["--wait-timeout", "17"] for call in operator.calls())
+    call = ["docker", "compose", "up"]
+    if target == "recreate":
+        call += ["--build", "--force-recreate"]
+    call += ["-d", "--wait", "--wait-timeout", "17"]
+    try:
+        started = time.monotonic()
+        try:
+            result = operator.run(
+                target,
+                "STARTUP_TIMEOUT_SECONDS=17",
+                "COMPOSE_TIMEOUT_SECONDS=1",
+                HANG_CALL=json.dumps(call),
+                test_timeout=4,
+            )
+        except subprocess.TimeoutExpired:
+            pytest.fail("Compose startup exceeded its configured outer deadline")
+        assert result.returncode != 0
+        assert time.monotonic() - started < 4
+        operator.assert_child_stopped()
+    finally:
+        operator.cleanup_fake_processes()
+
+
+@pytest.mark.parametrize("role", ["CURATOR_MODEL", "EMBEDDING_MODEL"])
+def test_model_roles_require_explicit_tags_before_downloads(operator, role):
+    config = json.loads(operator.config())
+    config["services"]["proxy"]["environment"][role] = "untagged-model"
+    result = operator.run("essentials", COMPOSE_CONFIG=json.dumps(config))
+    assert result.returncode != 0
+    assert role in result.stdout + result.stderr and "tag" in result.stdout + result.stderr
+    assert not mutations(operator)
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "forever", "1.5", "90000"])
+def test_invalid_startup_timeout_is_rejected_before_docker_io(operator, timeout):
+    result = operator.run("up", "STARTUP_TIMEOUT_SECONDS=" + timeout)
+    assert result.returncode != 0
+    assert "STARTUP_TIMEOUT_SECONDS" in result.stdout + result.stderr
+    assert not operator.calls()
+
+
+def test_command_line_data_override_wins_over_environment_literally(operator):
+    result = operator.run(
+        "status",
+        "COMPOSE_PROJECT_NAME=literal-cli",
+        COMPOSE_PROJECT_NAME="different-environment",
+    )
+    successful(result)
+    assert set((operator.root / "projects.log").read_text().splitlines()) == {"literal-cli"}
+
+
+def test_logs_follow_is_the_explicit_unbounded_exception(operator):
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            operator.run(
+                "logs",
+                "COMPOSE_TIMEOUT_SECONDS=1",
+                test_timeout=2.5,
+                HANG_CALL=json.dumps(["docker", "compose", "logs", "--tail", "100", "--follow"]),
+            )
+    finally:
+        operator.cleanup_fake_processes()
