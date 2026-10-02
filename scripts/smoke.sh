@@ -30,7 +30,7 @@ import json
 import logging
 import os
 import sys
-from time import monotonic
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import httpx
@@ -63,6 +63,25 @@ def passed(message):
     print(f"PASS: {message}", flush=True)
 
 
+async def bounded_close(close, seconds, *, failing):
+    try:
+        async with asyncio.timeout(seconds):
+            await close()
+    except (Exception, asyncio.CancelledError):
+        # Preserve an existing content-free failure while still bounding cleanup.
+        if not failing:
+            raise SmokeFailure("Smoke cleanup failed or timed out. Inspect database/client connectivity and docker compose logs proxy worker; rerun after recovery.") from None
+
+
+@asynccontextmanager
+async def smoke_client(settings, cleanup_seconds):
+    client = httpx.AsyncClient(timeout=settings.upstream_timeout_seconds + 10)
+    try:
+        yield client
+    finally:
+        await bounded_close(client.aclose, cleanup_seconds, failing=sys.exc_info()[0] is not None)
+
+
 async def run():
     settings = Settings()
     model = os.environ["SMOKE_MODEL"]
@@ -72,7 +91,8 @@ async def run():
         require(0 < deadline_seconds <= 3600, "Set SMOKE_TIMEOUT_SECONDS between 1 and 3600.")
     except ValueError:
         raise SmokeFailure("Set SMOKE_TIMEOUT_SECONDS to seconds, e.g. 300.") from None
-    async with httpx.AsyncClient(timeout=settings.upstream_timeout_seconds + 10) as client:
+    cleanup_seconds = min(5, deadline_seconds)
+    async with smoke_client(settings, cleanup_seconds) as client:
         proxy = "http://127.0.0.1:8080"
         try:
             health = await client.get(f"{proxy}/healthz")
@@ -157,21 +177,24 @@ async def run():
         passed(f"non-streaming completion ({model})")
         database = Database.create(settings)
         try:
-            deadline = monotonic() + deadline_seconds
-            while True:
-                async with database.session() as session:
-                    project_id = await session.scalar(select(projects.c.id).where(projects.c.external_project_id == project_a))
-                    jobs = (await session.execute(select(memory_jobs.c.status, memory_jobs.c.error_category).where(memory_jobs.c.project_id == project_id))).all()
-                    active = (await session.execute(select(memory_items.c.id).where(
-                        memory_items.c.project_id == project_id, memory_items.c.state == "active",
-                        memory_items.c.text.contains(marker)))).all()
-                require(not any(status == "failed" for status, _ in jobs),
-                        "Synthetic memory job failed terminally. Inspect worker categories, curator schema/evidence and model inference; fix dependencies before a new smoke run.")
-                if jobs and all(status == "completed" for status, _ in jobs):
-                    require(bool(active), "Worker finished with no supported synthetic memory. Curator may have omitted/paraphrased the decision; verify CURATOR_MODEL structured output/evidence, or use a stronger curator, restart worker and rerun.")
-                    break
-                require(monotonic() < deadline, "Worker progress timed out. Check docker compose logs worker, durable job status/lease/retry categories, curator/embedder inference; increase SMOKE_TIMEOUT_SECONDS for a slow host.")
-                await asyncio.sleep(1)
+            try:
+                # Covers connection acquisition, every query, transaction exit and sleep.
+                async with asyncio.timeout(deadline_seconds):
+                    while True:
+                        async with database.session() as session:
+                            project_id = await session.scalar(select(projects.c.id).where(projects.c.external_project_id == project_a))
+                            jobs = (await session.execute(select(memory_jobs.c.status, memory_jobs.c.error_category).where(memory_jobs.c.project_id == project_id))).all()
+                            active = (await session.execute(select(memory_items.c.id).where(
+                                memory_items.c.project_id == project_id, memory_items.c.state == "active",
+                                memory_items.c.text.contains(marker)))).all()
+                        require(not any(status == "failed" for status, _ in jobs),
+                                "Synthetic memory job failed terminally. Inspect worker categories, curator schema/evidence and model inference; fix dependencies before a new smoke run.")
+                        if jobs and all(status == "completed" for status, _ in jobs):
+                            require(bool(active), "Worker finished with no supported synthetic memory. Curator may have omitted/paraphrased the decision; verify CURATOR_MODEL structured output/evidence, or use a stronger curator, restart worker and rerun.")
+                            break
+                        await asyncio.sleep(1)
+            except (TimeoutError, asyncio.CancelledError):
+                raise SmokeFailure("Worker progress timed out. Check docker compose logs worker, durable job status/lease/retry categories, curator/embedder inference; increase SMOKE_TIMEOUT_SECONDS for a slow host.") from None
             passed(f"worker durable completion and accepted memory (jobs={len(jobs)}, memories={len(active)})")
             query = "Which exact backend name did we select for durable memory? Reply only with its name; reply UNKNOWN if no project evidence identifies it."
             same = await chat(project_a, "fresh-recall", query, stream=True)
@@ -189,7 +212,7 @@ async def run():
                     "Vector recall/isolation failed. Inspect exact project filtering and reindex the affected project; PostgreSQL is authoritative.")
             passed(f"cross-project isolation (foreign vector hits={len(foreign_hits)})")
         finally:
-            await database.engine.dispose()
+            await bounded_close(database.engine.dispose, cleanup_seconds, failing=sys.exc_info()[0] is not None)
     passed("live smoke complete; synthetic project records retained locally")
 
 
