@@ -287,7 +287,17 @@ ORDER BY p.created_at DESC, p.id
 LIMIT 20;
 ```
 
-Choose an internal `project_id` UUID from that result, replace the placeholder, and set a psql variable. The following project-scoped queries use quoted psql substitution (`:'project_id'`), not string interpolation in shell commands. In a GUI, replace `:'project_id'` with a quoted UUID literal instead.
+**Optional sensitive project identity lookup (explicit opt-in).** If you cannot map those opaque UUIDs to the repository you intend to inspect, run this query privately. Root paths/project identities can be sensitive; the 200-character preview is not redaction. The external ID is shown only as a comparison fingerprint, which is not a guarantee of anonymization. If `root_label` is absent or ambiguous, compare the fingerprint with PostgreSQL `md5` of your privately known exact external project ID. Do not export or share this result.
+
+```sql
+SELECT id AS project_id, left(root_label, 200) AS root_label_preview,
+       md5(external_project_id) AS external_project_fingerprint
+FROM projects
+ORDER BY created_at DESC, id
+LIMIT 20;
+```
+
+Choose the intended internal `project_id` UUID from the count result or the optional identity lookup, replace the placeholder, and set a psql variable. The following queries return to metadata-only project inspection and use quoted psql substitution (`:'project_id'`), not string interpolation in shell commands. In a GUI, replace `:'project_id'` with a quoted UUID literal instead.
 
 ```text
 \set project_id 'REPLACE_WITH_INTERNAL_PROJECT_UUID'
