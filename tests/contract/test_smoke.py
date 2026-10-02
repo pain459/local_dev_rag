@@ -36,6 +36,7 @@ elif args[:3] == ["compose", "exec", "-T"]:
     import local_dev_rag.db
     import local_dev_rag.ollama
     import local_dev_rag.vector_store
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     mode = os.environ["SMOKE_TEST_MODE"]
     events = []
@@ -58,6 +59,7 @@ elif args[:3] == ["compose", "exec", "-T"]:
     def transport(request):
         path = request.url.path
         if path == "/healthz":
+            state["unrelated"] = asyncio.create_task(stall("unrelated"))
             return httpx.Response(200, json={"status": "ok"})
         if path == "/api/tags":
             tags = [{"name": m} for m in [*models, "nomic-embed-text:latest"]]
@@ -93,6 +95,14 @@ elif args[:3] == ["compose", "exec", "-T"]:
                     await stall("client_close")
             finally:
                 await super().aclose()
+                unrelated = state["unrelated"]
+                if not unrelated.done():
+                    record("unrelated_alive_before_client_close")
+                unrelated.cancel()
+                try:
+                    await unrelated
+                except asyncio.CancelledError:
+                    pass
                 record("client_closed")
 
         async def __aexit__(self, *args):
@@ -105,7 +115,7 @@ elif args[:3] == ["compose", "exec", "-T"]:
             self.queries = 0
 
         async def scalar(self, statement):
-            if mode in {"project_query", "cleanup_stalls"}:
+            if mode in {"project_query", "cleanup_stalls", "shielded_exit", "stubborn_exit"}:
                 await stall("query")
             if mode == "cancelled_query":
                 raise asyncio.CancelledError("private exception payload")
@@ -119,6 +129,33 @@ elif args[:3] == ["compose", "exec", "-T"]:
             rows = [("completed", None)] if self.queries == 1 else [(memory,)]
             return SimpleNamespace(all=lambda: rows)
 
+    class Transaction:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            # Real async_sessionmaker.begin() awaits this in a shielded child task
+            # after its cancelled query starts unwinding the surrounding session.
+            if mode == "stubborn_exit":
+                while True:
+                    try:
+                        await stall("transaction_exit")
+                    except asyncio.CancelledError:
+                        record("transaction_exit_resisted_cancellation")
+            else:
+                await stall("transaction_exit")
+
+    class ShieldedSession(AsyncSession):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.queries = 0
+
+        scalar = Session.scalar
+        execute = Session.execute
+
+        def begin(self):
+            return Transaction()
+
     class Database:
         def __init__(self):
             self.engine = SimpleNamespace(dispose=self.dispose)
@@ -129,7 +166,11 @@ elif args[:3] == ["compose", "exec", "-T"]:
             try:
                 if mode == "connection":
                     await stall("connection")
-                yield Session()
+                if mode in {"shielded_exit", "stubborn_exit"}:
+                    async with async_sessionmaker(class_=ShieldedSession).begin() as session:
+                        yield session
+                else:
+                    yield Session()
             finally:
                 record("session_closed")
 
@@ -192,7 +233,16 @@ def run_smoke(tmp_path, *, mode="normal", timeout="0.05"):
 
 @pytest.mark.parametrize(
     "mode",
-    ["connection", "project_query", "query_1", "query_2", "cleanup_stalls", "cancelled_query"],
+    [
+        "connection",
+        "project_query",
+        "query_1",
+        "query_2",
+        "cleanup_stalls",
+        "cancelled_query",
+        "shielded_exit",
+        "stubborn_exit",
+    ],
 )
 def test_worker_deadline_bounds_all_database_awaits_and_cleanup(tmp_path, mode):
     result, events, elapsed = run_smoke(tmp_path, mode=mode)
@@ -203,9 +253,15 @@ def test_worker_deadline_bounds_all_database_awaits_and_cleanup(tmp_path, mode):
     assert "session_closed" in events
     assert "database_closed" in events
     assert "client_closed" in events
+    assert "unrelated_alive_before_client_close" in events
     assert "Traceback" not in result.stderr
     assert "private exception payload" not in result.stderr
     assert "quartz" not in result.stdout + result.stderr
+    if mode in {"shielded_exit", "stubborn_exit"}:
+        assert "transaction_exit_started" in events
+        assert "transaction_exit_cancelled" in events
+    if mode == "stubborn_exit":
+        assert "transaction_exit_resisted_cancellation" in events
 
 
 @pytest.mark.parametrize("timeout", ["0.05", "1", "3600"])

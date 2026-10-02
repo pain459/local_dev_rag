@@ -31,6 +31,7 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from uuid import uuid4
 
 import httpx
@@ -63,10 +64,59 @@ def passed(message):
     print(f"PASS: {message}", flush=True)
 
 
+operation_owner = ContextVar("smoke_operation_owner", default=None)
+
+
+async def bounded_operation(operation, seconds, cleanup_seconds):
+    """Wait independently of unwinding, then cancel/drain only this scope's tasks."""
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    scope, owned = object(), set()
+
+    def task_factory(loop, coroutine, context=None):
+        if previous_factory is None:
+            task = asyncio.Task(coroutine, loop=loop, context=context)
+        else:
+            task = previous_factory(loop, coroutine, context=context)
+        owner = operation_owner.get() if context is None else context.get(operation_owner)
+        if owner is scope:
+            owned.add(task)
+        return task
+
+    token = operation_owner.set(scope)
+    loop.set_task_factory(task_factory)
+    try:
+        task = asyncio.create_task(operation())
+        done, _ = await asyncio.wait({task}, timeout=seconds)
+        if not done:
+            raise TimeoutError
+        return task.result()
+    finally:
+        # A cancelled query can create a shielded SQLAlchemy rollback/close task.
+        # Include new descendants while draining; never await gather/wait_for here.
+        cleanup_deadline = loop.time() + cleanup_seconds
+        try:
+            while True:
+                pending = {task for task in owned if not task.done()}
+                if not pending:
+                    break
+                for task in pending:
+                    task.cancel()
+                remaining = cleanup_deadline - loop.time()
+                if remaining <= 0:
+                    break
+                await asyncio.wait(pending, timeout=min(0.01, remaining))
+            for task in owned:
+                if task.done() and not task.cancelled():
+                    task.exception()  # Retrieve failures without serializing their contents.
+        finally:
+            loop.set_task_factory(previous_factory)
+            operation_owner.reset(token)
+
+
 async def bounded_close(close, seconds, *, failing):
     try:
-        async with asyncio.timeout(seconds):
-            await close()
+        await bounded_operation(close, seconds, seconds)
     except (Exception, asyncio.CancelledError):
         # Preserve an existing content-free failure while still bounding cleanup.
         if not failing:
@@ -177,22 +227,23 @@ async def run():
         passed(f"non-streaming completion ({model})")
         database = Database.create(settings)
         try:
+            async def poll_worker():
+                while True:
+                    async with database.session() as session:
+                        project_id = await session.scalar(select(projects.c.id).where(projects.c.external_project_id == project_a))
+                        jobs = (await session.execute(select(memory_jobs.c.status, memory_jobs.c.error_category).where(memory_jobs.c.project_id == project_id))).all()
+                        active = (await session.execute(select(memory_items.c.id).where(
+                            memory_items.c.project_id == project_id, memory_items.c.state == "active",
+                            memory_items.c.text.contains(marker)))).all()
+                    require(not any(status == "failed" for status, _ in jobs),
+                            "Synthetic memory job failed terminally. Inspect worker categories, curator schema/evidence and model inference; fix dependencies before a new smoke run.")
+                    if jobs and all(status == "completed" for status, _ in jobs):
+                        require(bool(active), "Worker finished with no supported synthetic memory. Curator may have omitted/paraphrased the decision; verify CURATOR_MODEL structured output/evidence, or use a stronger curator, restart worker and rerun.")
+                        return project_id, jobs, active
+                    await asyncio.sleep(1)
+
             try:
-                # Covers connection acquisition, every query, transaction exit and sleep.
-                async with asyncio.timeout(deadline_seconds):
-                    while True:
-                        async with database.session() as session:
-                            project_id = await session.scalar(select(projects.c.id).where(projects.c.external_project_id == project_a))
-                            jobs = (await session.execute(select(memory_jobs.c.status, memory_jobs.c.error_category).where(memory_jobs.c.project_id == project_id))).all()
-                            active = (await session.execute(select(memory_items.c.id).where(
-                                memory_items.c.project_id == project_id, memory_items.c.state == "active",
-                                memory_items.c.text.contains(marker)))).all()
-                        require(not any(status == "failed" for status, _ in jobs),
-                                "Synthetic memory job failed terminally. Inspect worker categories, curator schema/evidence and model inference; fix dependencies before a new smoke run.")
-                        if jobs and all(status == "completed" for status, _ in jobs):
-                            require(bool(active), "Worker finished with no supported synthetic memory. Curator may have omitted/paraphrased the decision; verify CURATOR_MODEL structured output/evidence, or use a stronger curator, restart worker and rerun.")
-                            break
-                        await asyncio.sleep(1)
+                project_id, jobs, active = await bounded_operation(poll_worker, deadline_seconds, cleanup_seconds)
             except (TimeoutError, asyncio.CancelledError):
                 raise SmokeFailure("Worker progress timed out. Check docker compose logs worker, durable job status/lease/retry categories, curator/embedder inference; increase SMOKE_TIMEOUT_SECONDS for a slow host.") from None
             passed(f"worker durable completion and accepted memory (jobs={len(jobs)}, memories={len(active)})")
@@ -216,12 +267,19 @@ async def run():
     passed("live smoke complete; synthetic project records retained locally")
 
 
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
 try:
-    asyncio.run(run())
+    loop.run_until_complete(run())
 except SmokeFailure as error:
     print(f"FAIL: {error}", file=sys.stderr)
     sys.exit(1)
 except Exception:
     print("FAIL: unexpected transport/schema/database failure; inspect /readyz, docker compose logs proxy worker and installed versions. Response bodies and exception text suppressed.", file=sys.stderr)
     sys.exit(1)
+finally:
+    # Owned tasks already received a bounded cancel/drain. asyncio.run's final
+    # unbounded gather could hang on cancellation-resistant dependency cleanup.
+    loop.close()
+    asyncio.set_event_loop(None)
 PY
