@@ -13,6 +13,7 @@ from local_dev_rag.db import Database
 from local_dev_rag.domain import InvalidRequestError, RequestIdentity
 from local_dev_rag.logging import RequestLoggingMiddleware, compact_id, configure_logging
 from local_dev_rag.models import ModelRegistry, UnknownModelError
+from local_dev_rag.observations import ObservationStore, valid_observation_id
 from local_dev_rag.ollama import OllamaClient
 from local_dev_rag.proxy import MemorySearch, ProxyService
 from local_dev_rag.readiness import HealthProbe, ReadinessService
@@ -64,6 +65,8 @@ def create_app(
     registry = ModelRegistry(app.state.settings)
     app.state.model_registry = registry
     app.state.ollama_client = ollama_client or OllamaClient(app.state.settings)
+    observations = ObservationStore()
+    app.state.observations = observations
 
     app.state.vector_store = vector_store or VectorStore(app.state.settings)
     app.state.readiness_service = readiness_service or ReadinessService(
@@ -101,6 +104,11 @@ def create_app(
     @app.post("/v1/chat/completions")
     async def chat(request: Request) -> Response:
         identity = RequestIdentity.from_headers(request.headers)
+        observation_id = request.headers.get("x-opencode-rag-observation-id")
+        if observation_id is not None and not valid_observation_id(observation_id):
+            raise InvalidRequestError(
+                "Observation ID must be a canonical UUID v4", "x-opencode-rag-observation-id"
+            )
         request.state.log_identity = {
             "project_id": compact_id(identity.project_id),
             "session_id": compact_id(identity.session_id),
@@ -130,7 +138,21 @@ def create_app(
             payload,
             state=request.scope.setdefault("state", {}),
         )
+        if observation_id is not None:
+            observations.put(observation_id, identity, result.diagnostics.injected_memory_tokens)
         return result.response
+
+    @app.get("/v1/rag/observations/{observation_id}")
+    async def observation(observation_id: str, request: Request) -> JSONResponse:
+        identity = RequestIdentity.from_headers(request.headers)
+        tokens = observations.get(observation_id, identity) if valid_observation_id(
+            observation_id
+        ) else None
+        if tokens is None:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+        return JSONResponse(
+            content={"injected_memory_tokens": tokens}, headers={"Cache-Control": "no-store"}
+        )
 
     @app.get("/healthz", response_model=HealthResponse)
     async def health() -> HealthResponse:

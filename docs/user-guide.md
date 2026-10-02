@@ -36,6 +36,8 @@ By default the stack publishes only `127.0.0.1:8080`. PostgreSQL and Chroma have
 
 “Durable history” means history can outlive a model's context window and an OpenCode session. It does not mean infinite context, unlimited disk space, or guaranteed recall. By default each request can inject at most six relevant memories within a 1024-token memory budget, alongside bounded recent conversation. A completed turn can produce no accepted memories. Store requirements that must never be missed in a reviewed repository document too.
 
+When the proxy applies memory, OpenCode appends `🧠 RAG memory applied · <N> context tokens` inline after the response. The count is the proxy's estimated memory context size. This programmatic status line contains no memory text and is ignored by the model and memory capture. Retrieval misses and unavailable diagnostics stay silent; no notice does not prove that memory was absent.
+
 ## Five-minute path
 
 This is a short path once host tools, images, and models are installed. First-time downloads and a full smoke test can take substantially longer than five minutes.
