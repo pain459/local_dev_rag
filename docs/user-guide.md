@@ -310,6 +310,8 @@ Three stores have different purposes:
 | PostgreSQL named volume | Proxy-captured events, accepted memories, provenance, jobs | PostgreSQL backup/restore in the operations guide |
 | Chroma named volume | Search vectors for active memories | Rebuild from PostgreSQL after restoring/changing embeddings |
 
+To inspect stored events, memory provenance, curation jobs, or index counts, follow [Inspecting and visualizing RAG data](operations-guide.md#inspecting-and-visualizing-rag-data). It includes container-only read-only queries and an optional loopback-only database GUI connection.
+
 OpenCode saves its session data independently on the host (standard macOS/Linux data directory: `~/.local/share/opencode/`; actual paths can vary with environment). `opencode debug paths` shows paths for your installation. See [OpenCode storage documentation](https://opencode.ai/docs/troubleshooting/#storage). Do not clear this directory as a casual cache remedy: it contains application/session data.
 
 The following forms were checked against OpenCode **1.18.30** help and its [CLI reference](https://opencode.ai/docs/cli/). Later releases can reorganize commands; use your installed `--help` before adapting them.

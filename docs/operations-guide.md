@@ -13,6 +13,7 @@ Run commands from this checkout. Examples assume the default Compose file and po
 - [Runtime context acceptance](#runtime-context-acceptance)
 - [Standard runbooks](#standard-runbooks)
 - [Health and observability](#health-and-observability)
+- [Inspecting and visualizing RAG data](#inspecting-and-visualizing-rag-data)
 - [Backup and restore](#backup-and-restore)
 - [Migrations](#migrations)
 - [Reindex and embedding changes](#reindex-and-embedding-changes)
@@ -217,6 +218,250 @@ docker compose exec -T postgres sh -c 'psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_
 ```
 
 Record counts/oldest age before maintenance. Monitor growing age, retry/failure counts, unavailable capture, pressure, and backup failures against local requirements. Green readiness with growing pending jobs needs investigation.
+
+## Inspecting and visualizing RAG data
+
+PostgreSQL is the primary inspection surface: it owns captured events, curated memories, provenance, and curation jobs. Chroma is a rebuildable derived search index. A database GUI can browse tables, show foreign-key relationships, and chart query results; it does not automatically visualize embeddings, semantic similarity, or the application's retrieval ranking. Retrieval also filters by project, revalidates active PostgreSQL rows, and applies ranking and context limits.
+
+| Table | What it tells you |
+| --- | --- |
+| `projects` | Internal UUID and external memory namespace; remote/root labels may be sensitive |
+| `sessions` | Project-scoped captured session identity, separate from OpenCode's host history |
+| `conversation_events` | Ordered captured events, roles/completion state, and sensitive JSONB `payload` |
+| `memory_items` | Curated `text`, kind/state, scores, canonical source, and embedding model/version |
+| `memory_sources` | Additional supporting-event checkpoints for a memory, including deduplicated evidence |
+| `memory_jobs` | Durable curation status, attempts, scheduling, leases, and failures |
+
+These queries target [schema revision `0001`](../migrations/versions/0001_initial_memory_schema.py). Check [migration compatibility](#migrations) if a table/column is missing; do not alter records to make an inspection query work. Do not edit PostgreSQL or Chroma records through a GUI. Database contents, GUI caches, saved passwords, exports, screenshots, and query results can expose sensitive code, credentials, or personal information. Keep inspection local and private; even metadata can reveal activity and project identities.
+
+### Container-only psql (no host port)
+
+Use the running container without installing host PostgreSQL tools or publishing ports. This shell expands only the container's configured user/database, never its password. `-X` skips personal psql startup files, read-only transactions guard against accidental writes, a ten-second statement timeout bounds queries, and history is disabled:
+
+```sh
+docker compose exec postgres sh -c 'PGOPTIONS="-c default_transaction_read_only=on -c statement_timeout=10000" PSQL_HISTORY=/dev/null exec psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+Useful commands inside psql:
+
+```text
+\conninfo
+SHOW default_transaction_read_only;
+SELECT current_database(), current_user;
+SELECT version_num FROM alembic_version;
+\dt public.*
+\d memory_items
+\d memory_sources
+\d memory_jobs
+\pset pager off
+\x auto
+\timing on
+```
+
+Confirm `default_transaction_read_only` is `on`, the intended database/user, and the expected schema. `\d` displays columns, indexes, and foreign keys without reading content. `\x auto` expands wide rows; `\pset pager off` avoids entering a pager. Ctrl-C cancels the current query; `\q` exits psql safely. If a pager is already open, press `q` to return to psql first. Do not use `\o` or export results unless you intend to retain a protected private file.
+
+For a one-shot query, use the same read-only guard and `-T` for noninteractive execution:
+
+```sh
+docker compose exec -T postgres sh -c 'PGOPTIONS="-c default_transaction_read_only=on -c statement_timeout=10000" exec psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT state, count(*) FROM memory_items GROUP BY state ORDER BY state;"'
+```
+
+### Metadata-only SQL
+
+Run these in the guarded psql session. Counts are snapshots; an event need not produce a memory, and a completed curation job can legitimately accept zero memories. Start with overall counts and per-project counts (separate subqueries avoid multiplying rows across joins):
+
+```sql
+SELECT (SELECT count(*) FROM projects) AS projects,
+       (SELECT count(*) FROM sessions) AS sessions,
+       (SELECT count(*) FROM conversation_events) AS events,
+       (SELECT count(*) FROM memory_items) AS memories,
+       (SELECT count(*) FROM memory_sources) AS supporting_sources,
+       (SELECT count(*) FROM memory_jobs) AS jobs;
+
+SELECT p.id AS project_id, p.created_at,
+       (SELECT count(*) FROM sessions s WHERE s.project_id = p.id) AS sessions,
+       (SELECT count(*) FROM conversation_events e WHERE e.project_id = p.id) AS events,
+       (SELECT count(*) FROM memory_items m WHERE m.project_id = p.id) AS memories
+FROM projects p
+ORDER BY p.created_at DESC, p.id
+LIMIT 20;
+```
+
+Choose an internal `project_id` UUID from that result, replace the placeholder, and set a psql variable. The following project-scoped queries use quoted psql substitution (`:'project_id'`), not string interpolation in shell commands. In a GUI, replace `:'project_id'` with a quoted UUID literal instead.
+
+```text
+\set project_id 'REPLACE_WITH_INTERNAL_PROJECT_UUID'
+```
+
+Recent event metadata and memory state/kind summaries:
+
+```sql
+SELECT id AS event_id, session_id, sequence, event_type, role,
+       completed, model, created_at
+FROM conversation_events
+WHERE project_id = :'project_id'::uuid
+ORDER BY created_at DESC, id
+LIMIT 20;
+
+SELECT state, kind, count(*) AS memories,
+       min(created_at) AS oldest_created, max(updated_at) AS latest_updated
+FROM memory_items
+WHERE project_id = :'project_id'::uuid
+GROUP BY state, kind
+ORDER BY state, kind;
+```
+
+Memory-to-source-event provenance, including the canonical source on `memory_items` and supporting checkpoints on `memory_sources`. `UNION` removes duplicate canonical/checkpoint pairs; joining on the project/session/event tuple preserves scope:
+
+```sql
+WITH provenance AS (
+    SELECT project_id, id AS memory_id, source_session_id, source_event_id
+    FROM memory_items
+    WHERE project_id = :'project_id'::uuid
+    UNION
+    SELECT project_id, memory_id, source_session_id, source_event_id
+    FROM memory_sources
+    WHERE project_id = :'project_id'::uuid
+)
+SELECT m.id AS memory_id, m.kind, m.state,
+       e.id AS source_event_id, e.session_id, e.sequence,
+       e.event_type, e.role, e.completed, e.created_at AS event_created_at
+FROM provenance p
+JOIN memory_items m ON m.project_id = p.project_id AND m.id = p.memory_id
+JOIN conversation_events e ON e.project_id = p.project_id
+    AND e.session_id = p.source_session_id AND e.id = p.source_event_id
+ORDER BY m.created_at DESC, m.id, e.sequence, e.id
+LIMIT 50;
+```
+
+Curation job status and recent retry/failure metadata, omitting raw `error_message`:
+
+```sql
+SELECT status, error_category, count(*) AS jobs,
+       min(created_at) AS oldest_created,
+       min(next_attempt_at) AS earliest_next_attempt,
+       min(lease_expires_at) AS earliest_lease_expiry
+FROM memory_jobs
+WHERE project_id = :'project_id'::uuid
+GROUP BY status, error_category
+ORDER BY status, error_category;
+
+SELECT id AS job_id, session_id, source_event_id, job_kind, status,
+       attempt_count, error_category, next_attempt_at, lease_expires_at,
+       created_at, started_at, completed_at
+FROM memory_jobs
+WHERE project_id = :'project_id'::uuid AND status IN ('retry', 'failed')
+ORDER BY created_at DESC, id
+LIMIT 20;
+```
+
+Use categories with worker health and bounded logs to diagnose failures. Reindexing restores vectors for accepted memories; it does not rerun failed curation or clear terminal job state. Follow [incident triage](#incident-triage) before maintenance.
+
+### Sensitive content SQL (explicit opt-in)
+
+Only run this query when you need to inspect actual memory evidence. It prints text that can contain secrets; truncation to 500 characters is a display limit, not redaction. Review privately and avoid screenshots, exports, or shared terminal logs. `payload`, session titles, remote/root labels, and raw job error messages also require deliberate private inspection; the metadata queries above omit them.
+
+```sql
+SELECT id AS memory_id, kind, state, confidence, importance,
+       source_event_id, created_at, left(text, 500) AS memory_text_preview
+FROM memory_items
+WHERE project_id = :'project_id'::uuid
+ORDER BY created_at DESC, id
+LIMIT 10;
+```
+
+### Chroma collection and count inspection
+
+Keep Chroma unpublished. The following command runs inside the proxy and uses only HTTP GET requests to inspect the collection selected by its current embedding configuration. It uses the pinned Chroma 0.6.3 server's v2 inspection routes with the adapter's default tenant/database; its v1 collection GET routes can fail with HTTP 400. It does not call the adapter's get-or-create path or retrieve documents, vectors, or per-memory metadata. A missing collection is valid before the first indexing/retrieval activity and after changing embedding settings.
+
+```sh
+docker compose exec -T proxy python - <<'PY'
+from hashlib import sha256
+import httpx
+from local_dev_rag.config import Settings
+
+settings = Settings()
+digest = sha256(settings.embedding_model.encode("utf-8")).hexdigest()[:12]
+name = f"local_dev_rag_memory_v{settings.embedding_version}_{digest}"
+path = "/api/v2/tenants/default_tenant/databases/default_database/collections"
+with httpx.Client(base_url=settings.chromadb_url.rstrip("/"), timeout=5) as client:
+    response = client.get(f"{path}/{name}")
+    missing = response.status_code == 404 or (
+        response.status_code == 400 and response.json().get("error") == "InvalidCollection"
+    )
+    if missing:
+        print(f"collection={name} absent")
+    else:
+        response.raise_for_status()
+        collection = response.json()
+        count = client.get(f"{path}/{collection['id']}/count")
+        count.raise_for_status()
+        print(f"collection={name} space={(collection.get('metadata') or {}).get('hnsw:space')} count={count.json()}")
+PY
+```
+
+For a rough global count comparison, run this PostgreSQL query in the guarded session. Match the model/version group to the proxy's private configuration; do not compare only one project's count with a shared collection's total:
+
+```sql
+SELECT embedding_model, embedding_version, count(*) AS active_memories
+FROM memory_items
+WHERE state = 'active'
+GROUP BY embedding_model, embedding_version
+ORDER BY embedding_model, embedding_version;
+```
+
+The current collection is shared across projects but retrieval is project-filtered. Pending indexing, live writes, retired rows with stale vectors, and old model/version collections can explain differences. Equal counts do not prove identical IDs, correct embeddings, or recall. Check durable jobs and known same-project recall; repair through the [reindex runbook](#reindex-and-embedding-changes), not manual edits to Chroma's SQLite/HNSW files or API records.
+
+### Optional local database GUI
+
+For DBeaver or pgAdmin, explicitly apply [compose.inspect.yaml](../compose.inspect.yaml) alongside the normal file. It adds only `127.0.0.1:${POSTGRES_INSPECT_PORT:-5433}:5432` to PostgreSQL; Chroma stays unpublished and the default `compose.yaml` stays private. These examples assume the normal file is `compose.yaml`. If you use another base configuration, preserve its files and the existing `COMPOSE_PROJECT_NAME`; do not introduce a new `-p` project or attach different volumes. Explicit `-f` flags take precedence over `COMPOSE_FILE`.
+
+Pause clients and let in-flight work settle. Adding/removing a port recreates PostgreSQL and interrupts database connections; stop its dependent writers during the change. To choose a different free host port, replace `5433` below and use that same port in the GUI:
+
+```sh
+export POSTGRES_INSPECT_PORT=5433
+docker compose -f compose.yaml -f compose.inspect.yaml config --quiet
+docker compose -f compose.yaml stop proxy worker
+docker compose -f compose.yaml -f compose.inspect.yaml up -d --no-deps --force-recreate --wait --wait-timeout 120 postgres
+docker compose -f compose.yaml -f compose.inspect.yaml port postgres 5432
+docker compose -f compose.yaml -f compose.inspect.yaml up -d --wait --wait-timeout 120 proxy worker
+make ready COMPOSE_FILE=compose.yaml
+```
+
+Require the port command to report `127.0.0.1:5433` (or your chosen port) and verify readiness before resuming clients. Startup health alone is insufficient. Recreation reuses the existing named PostgreSQL volume; no volume deletion is needed. If any step fails, inspect the named service and follow the reversion sequence below.
+
+| GUI connection field | Value |
+| --- | --- |
+| Driver | PostgreSQL |
+| Host | `127.0.0.1` (avoid `localhost` IPv6/instance ambiguity) |
+| Port | `POSTGRES_INSPECT_PORT`, default `5433`; not the internal `5432` |
+| Database / username | Your private `POSTGRES_DB` / `POSTGRES_USER` for the initialized database |
+| Password | The initialized role's password, entered privately; never print it or put it in a URL/command |
+| Tunnel / remote access | None; use a GUI running on the host |
+
+A pgAdmin running in another container has its own loopback; these connection fields assume a host application. Keep saved credentials disabled where possible, protect GUI caches and query history, and do not share connection profiles. The example `local_rag` credentials apply only if you initialized the volume with those defaults. Editing `.env` later does not change an existing database password, and `DATABASE_URL` may select different application credentials/database.
+
+Enable the GUI's read-only connection/browsing mode. In every SQL editor connection, run `SET default_transaction_read_only = on;` and `SET statement_timeout = '10s';`, then confirm with `SHOW default_transaction_read_only;`. Use the metadata queries first and opt into content only when necessary. Client settings/session defaults are accident guards; they do not remove the role's write privileges. Avoid editable grids, schema changes, and automatic data previews of sensitive columns.
+
+When finished, disconnect the GUI and pause clients. Recreate PostgreSQL from the normal file alone to remove the host port, then restart dependents and verify readiness:
+
+```sh
+docker compose -f compose.yaml stop proxy worker
+docker compose -f compose.yaml up -d --no-deps --force-recreate --wait --wait-timeout 120 postgres
+docker compose -f compose.yaml port postgres 5432
+docker compose -f compose.yaml up -d --wait --wait-timeout 120 proxy worker
+make ready COMPOSE_FILE=compose.yaml
+unset POSTGRES_INSPECT_PORT
+```
+
+The port command must now report no published mapping (Compose may exit nonzero because no port is published). Confirm `docker compose -f compose.yaml ps postgres` shows no host mapping. Omitting the override from future commands alone does not close an existing publication; recreation is required. `restart` also does not remove ports. Preserve volumes and the project name throughout.
+
+| Symptom | Safe check and remedy |
+| --- | --- |
+| Host inspection port occupied | Identify the listener with `lsof -nP -iTCP:5433 -sTCP:LISTEN` where available; select another unused `POSTGRES_INSPECT_PORT`, reapply the override, and update the GUI port. Do not stop an unidentified database. |
+| Unexpected/empty tables or wrong project | Check `docker compose -f compose.yaml ps`, existing `COMPOSE_PROJECT_NAME`, psql `\conninfo`, `SELECT current_database(), current_user;`, revision and project UUIDs. Do not start a new Compose project or initialize/reset another volume to fix a connection. |
+| Authentication fails after `.env` edits | Existing volumes retain initialized roles/passwords. Use known valid private credentials and check explicit `DATABASE_URL`; follow [credential mismatch](#credential-mismatch). Do not reset volumes or echo passwords. |
+| GUI reaches another local PostgreSQL | Confirm the exact `127.0.0.1` host, chosen port, and `docker compose -f compose.yaml -f compose.inspect.yaml port postgres 5432` mapping. Compare database/revision and internal project UUIDs with container-only psql before inspecting any content. |
 
 ## Backup and restore
 

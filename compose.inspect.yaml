@@ -1,0 +1,6 @@
+# Opt-in host access for a local database GUI; use with compose.yaml.
+# Keep PostgreSQL private again by recreating it from compose.yaml alone.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:${POSTGRES_INSPECT_PORT:-5433}:5432"
