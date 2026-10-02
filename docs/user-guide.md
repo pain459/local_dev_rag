@@ -119,7 +119,7 @@ Read [.env.example](../.env.example), then edit your private `.env` using your e
 | `DATABASE_URL` | Leave blank so both apps construct an encoded URL from raw `POSTGRES_*`. Explicit overrides must percent-encode reserved credential characters and match PostgreSQL. |
 | `OLLAMA_URL` | Container address, default `http://host.docker.internal:11434`. Container `localhost` points to the container itself. |
 | `PROXY_PORT` | Host publication, default `8080`. If changed, also edit `provider.local-rag.options.baseURL` in [opencode.json](../opencode.json). Keep host publication on loopback. |
-| `DEFAULT_MODEL` | Proxy fallback model when a request omits a model. OpenCode's initial choice is separately set by `opencode.json`'s `model`. |
+| `DEFAULT_MODEL` | Model registry setting; the HTTP chat endpoint still requires an explicit `model`. OpenCode's initial choice is separately set by `opencode.json`'s `model`. |
 | `CURATOR_MODEL`, `EMBEDDING_MODEL` | Background roles; require explicit tags such as `nomic-embed-text:latest`. The embedder is not a chat model. |
 | `MODEL_BUDGETS` | Per-model context/output/safety limits; synchronize OpenCode limits and verified runtime allocation before changing them. |
 | `UPSTREAM_TIMEOUT_SECONDS` | Each upstream request timeout, default `120`; slow inference can require more time. |
