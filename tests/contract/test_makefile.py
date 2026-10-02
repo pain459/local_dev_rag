@@ -100,6 +100,7 @@ elif name == "opencode":
         for model in json.loads(os.environ["INSTALLED"])[:5]: print("local-rag/" + model)
 elif name == "node": print("v24.21.0")
 elif name == "uv":
+    pathlib.Path(os.environ["UV_POLICY_LOG"]).write_text(os.environ.get("UV_PYTHON_DOWNLOADS", ""))
     if "sync" in args: pathlib.Path(".venv").mkdir(exist_ok=True)
     else: print("uv 0.9.0")
 else:
@@ -147,6 +148,7 @@ def operator(tmp_path):
         "PROJECT_LOG": str(tmp_path / "projects.log"),
         "CHILD_PID": str(tmp_path / "child.pid"),
         "PARENT_PID": str(tmp_path / "parent.pid"),
+        "UV_POLICY_LOG": str(tmp_path / "uv-policy.txt"),
         "INSTALLED": json.dumps(MODELS),
         "COMPOSE_CONFIG": json.dumps(
             {
@@ -853,3 +855,9 @@ def test_logs_follow_is_the_explicit_unbounded_exception(operator):
             )
     finally:
         operator.cleanup_fake_processes()
+
+
+@pytest.mark.parametrize("target", ["essentials", "test", "check"])
+def test_uv_never_automatically_downloads_host_python(operator, target):
+    successful(operator.run(target, "UV_PYTHON_DOWNLOADS=automatic"))
+    assert (operator.root / "uv-policy.txt").read_text() == "never"

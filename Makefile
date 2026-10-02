@@ -24,6 +24,9 @@ override operator_literal_iterator := $(value operator_literal_iterator)
 export operator_literal_iterator
 override operator_user_variables := $(filter-out MAKEFLAGS MAKEOVERRIDES MFLAGS MAKELEVEL GNUMAKEFLAGS,$(.VARIABLES))
 $(foreach operator_literal_iterator,$(operator_user_variables),$(if $(filter command line environment,$(origin $(operator_literal_iterator))),$(eval override $(operator_literal_iterator) := $$(value $(operator_literal_iterator)))$(eval export $(operator_literal_iterator))))
+# Operator setup may download project dependencies, never a host Python runtime.
+override UV_PYTHON_DOWNLOADS := never
+export UV_PYTHON_DOWNLOADS
 export DOCKER COMPOSE COMPOSE_FILE UV PYTHON NODE OLLAMA OPENCODE LOG_TAIL
 export PROJECT CONFIRM
 export DIAGNOSTIC_TIMEOUT_SECONDS COMPOSE_TIMEOUT_SECONDS STARTUP_TIMEOUT_SECONDS DOWNLOAD_TIMEOUT_SECONDS

@@ -7,6 +7,8 @@ PYTHON=${PYTHON:-python3.12}
 NODE=${NODE:-node}
 OLLAMA=${OLLAMA:-ollama}
 OPENCODE=${OPENCODE:-opencode}
+UV_PYTHON_DOWNLOADS=never
+export UV_PYTHON_DOWNLOADS
 operator_dir=${0%/*}
 probe=$operator_dir/operator-probe.py
 runner=$operator_dir/operator-run.py
