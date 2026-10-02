@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize("explicit_url", [False, True])
-def test_compose_special_character_password_reaches_both_apps_intact(explicit_url, monkeypatch):
+def test_compose_special_character_password_reaches_both_apps_intact(
+    explicit_url, monkeypatch, tmp_path
+):
     from sqlalchemy.engine import make_url
 
     from local_dev_rag.config import Settings
@@ -24,18 +26,64 @@ def test_compose_special_character_password_reaches_both_apps_intact(explicit_ur
     encoded = (
         "postgresql+asyncpg://local_rag:synthetic%40password%3Awith%2Fslash@postgres:5432/local_rag"
     )
+    ambient_compose = tmp_path / "ambient-compose.yaml"
+    ambient_compose.write_text(
+        "services:\n  postgres:\n    environment:\n      POSTGRES_USER: ambient_file_user\n"
+    )
+    ambient = {
+        "DATABASE_URL": "postgresql+asyncpg://ambient:ambient@ambient:9999/ambient",
+        "POSTGRES_USER": "ambient_user",
+        "POSTGRES_PASSWORD": "ambient_password",
+        "POSTGRES_DB": "ambient_db",
+        "POSTGRES_HOST": "ambient_host",
+        "POSTGRES_PORT": "9999",
+        "COMPOSE_PROJECT_NAME": "ambient_project",
+        "COMPOSE_FILE": f"{ROOT / 'compose.yaml'}{os.pathsep}{ambient_compose}",
+        "COMPOSE_PATH_SEPARATOR": os.pathsep,
+    }
+    for key, value in ambient.items():
+        monkeypatch.setenv(key, value)
+    compose_environment = {
+        key: os.environ[key]
+        for key in (
+            "HOME",
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "DOCKER_CONFIG",
+            "DOCKER_API_VERSION",
+            "DOCKER_CERT_PATH",
+            "DOCKER_TLS_VERIFY",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+            "SSH_AUTH_SOCK",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        )
+        if key in os.environ
+    }
+    compose_environment.update(
+        {
+            "PATH": os.environ.get("PATH", os.defpath),
+            "DATABASE_URL": encoded if explicit_url else "",
+            "POSTGRES_USER": "local_rag",
+            "POSTGRES_PASSWORD": password,
+            "POSTGRES_DB": "local_rag",
+            "PROXY_PORT": "8080",
+            "OLLAMA_URL": "http://host.docker.internal:11434",
+        }
+    )
     config = json.loads(
         subprocess.check_output(
             ["docker", "compose", "--env-file", "/dev/null", "config", "--format", "json"],
             cwd=ROOT,
-            env={
-                **os.environ,
-                "POSTGRES_PASSWORD": password,
-                "DATABASE_URL": encoded if explicit_url else "",
-            },
+            env=compose_environment,
         )
     )
-    assert config["services"]["postgres"]["environment"]["POSTGRES_PASSWORD"] == password
+    assert config["name"] == ROOT.name
+    postgres_environment = config["services"]["postgres"]["environment"]
+    assert postgres_environment["POSTGRES_USER"] == "local_rag"
+    assert postgres_environment["POSTGRES_PASSWORD"] == password
+    assert postgres_environment["POSTGRES_DB"] == "local_rag"
     for name in ("proxy", "worker"):
         container_environment = {
             key: str(value) for key, value in config["services"][name]["environment"].items()
