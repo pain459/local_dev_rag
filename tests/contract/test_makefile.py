@@ -80,11 +80,21 @@ elif name in {"docker", "chosen-docker"}:
     elif args[:2] == ["compose", "version"]:
         if os.environ.get("COMPOSE_VERSION_FAIL"): sys.exit(1)
         print("Docker Compose version v5.5.1")
-    elif args[:2] == ["compose", "config"]:
-        if os.environ.get("COMPOSE_FAIL"): sys.exit(1)
+    elif args and args[0] == "compose" and "config" in args:
+        if os.environ.get("COMPOSE_FAIL"):
+            print(os.environ.get("COMPOSE_STDERR", ""), file=sys.stderr)
+            sys.exit(1)
         if "--format" in args:
+            if "COMPOSE_RAW_CONFIG" in os.environ:
+                print(os.environ["COMPOSE_RAW_CONFIG"])
+                sys.exit(0)
             config = json.loads(os.environ["COMPOSE_CONFIG"])
             config["name"] = os.environ.get("COMPOSE_PROJECT_NAME", "test-rag")
+            if os.environ.get("EXPOSE_DB") == "1":
+                config["services"]["postgres"].setdefault("ports", [{
+                    "host_ip": "127.0.0.1", "published": os.environ["POSTGRES_INSPECT_PORT"],
+                    "target": 5432, "protocol": "tcp",
+                }])
             print(json.dumps(config))
     elif args[:2] == ["compose", "ps"]:
         print(os.environ.get("RUNNING", "proxy\nworker\npostgres\nchromadb"))
@@ -596,7 +606,11 @@ def test_db_exposure_starts_with_overlay_and_reports_verified_mapping(
     if target == "recreate":
         startup += ["--build", "--force-recreate"]
     startup += ["-d", "--wait", "--wait-timeout", "120"]
-    assert operator.calls() == [startup, ["docker", "compose", "port", "postgres", "5432"]]
+    docker_calls = [call for call in operator.calls() if call[0] == "docker"]
+    assert docker_calls == [
+        ["docker", "compose", "config", "--format", "json"],
+        startup, ["docker", "compose", "port", "postgres", "5432"],
+    ]
     states = operator.compose_states()
     assert all(
         state["files"] == f"compose.yaml:{operator.root}/compose.inspect.yaml" for state in states
@@ -605,7 +619,7 @@ def test_db_exposure_starts_with_overlay_and_reports_verified_mapping(
     assert "127.0.0.1:" + expected in result.stdout
     assert "make recreate EXPOSE_DB=0" in result.stdout
     assert set((operator.root / "projects.log").read_text().splitlines()) == {"exposed-fixture"}
-    assert not any("--volumes" in call or "chromadb" in call or "config" in call
+    assert not any("--volumes" in call or "chromadb" in call
                    for call in operator.calls())
 
 
@@ -658,7 +672,10 @@ def test_db_exposure_verification_failure_is_clear(operator):
 def test_db_exposure_failed_startup_does_not_report_or_probe_success(operator):
     result = operator.run("up", "EXPOSE_DB=1", STARTUP_FAIL="1")
     assert result.returncode != 0
-    assert len(operator.calls()) == 1
+    docker_calls = [call for call in operator.calls() if call[0] == "docker"]
+    assert len(docker_calls) == 2
+    assert docker_calls[0] == ["docker", "compose", "config", "--format", "json"]
+    assert "up" in docker_calls[1]
     assert "127.0.0.1:5433" not in result.stdout
 
 
@@ -688,7 +705,8 @@ def test_db_exposure_preserves_explicit_compose_command_file_flags(operator, fil
     prefix = [
         "docker", "compose", *file_args.split(), "-f", str(operator.root / "compose.inspect.yaml"),
     ]
-    assert operator.calls() == [
+    assert [call for call in operator.calls() if call[0] == "docker"] == [
+        [*prefix, "config", "--format", "json"],
         [*prefix, "up", "-d", "--wait", "--wait-timeout", "120"],
         [*prefix, "port", "postgres", "5432"],
     ]
@@ -713,19 +731,107 @@ def test_db_exposure_overlay_is_only_applied_to_startup(operator, target):
     assert not any("postgres" in call and "port" in call for call in operator.calls())
 
 
-@pytest.mark.parametrize("operation", ["up", "port"])
+@pytest.mark.parametrize("operation", ["config", "probe", "up", "port"])
 def test_db_exposure_compose_calls_remain_deadline_supervised(operator, operation):
     call = ["docker", "compose", "up", "-d", "--wait", "--wait-timeout", "17"]
     if operation == "port":
         call = ["docker", "compose", "port", "postgres", "5432"]
+    elif operation == "config":
+        call = ["docker", "compose", "config", "--format", "json"]
+    elif operation == "probe":
+        call = ["python3.12", "scripts/operator-probe.py", "database-exposure", "5433"]
     try:
         result = operator.run("up", "EXPOSE_DB=1", "STARTUP_TIMEOUT_SECONDS=17",
-                              "COMPOSE_TIMEOUT_SECONDS=1", HANG_CALL=json.dumps(call),
+                              "COMPOSE_TIMEOUT_SECONDS=1", "DIAGNOSTIC_TIMEOUT_SECONDS=1",
+                              HANG_CALL=json.dumps(call),
                               test_timeout=4)
         assert result.returncode != 0
         operator.assert_child_stopped()
     finally:
         operator.cleanup_fake_processes()
+
+
+@pytest.mark.parametrize("target", ["up", "recreate"])
+@pytest.mark.parametrize("compose", ["", "docker compose -f custom.yaml"])
+@pytest.mark.parametrize(
+    ("service", "publication"),
+    [
+        ("postgres", {"host_ip": "0.0.0.0", "published": "15433", "target": 5432}),
+        ("postgres", {"host_ip": "::", "published": "15433", "target": 5432}),
+        ("chromadb", {"host_ip": "127.0.0.1", "published": "8000", "target": 8000}),
+        ("chromadb", {"host_ip": "0.0.0.0", "published": "8000", "target": 8000}),
+    ],
+)
+def test_db_exposure_preflight_rejects_extra_publications_before_startup(
+    operator, target, compose, service, publication,
+):
+    # Real Compose port returns only the first binding, even with extra publications.
+    config = json.loads(operator.config())
+    config["services"]["postgres"]["ports"] = [
+        {"host_ip": "127.0.0.1", "published": "5433", "target": 5432, "protocol": "tcp"},
+    ]
+    config["services"][service].setdefault("ports", []).append(publication)
+    config["services"]["postgres"]["environment"] = {"POSTGRES_PASSWORD": "rendered-secret"}
+    result = operator.run(
+        target, "EXPOSE_DB=1", "COMPOSE=" + compose, "COMPOSE_PROJECT_NAME=unsafe-fixture",
+        COMPOSE_CONFIG=json.dumps(config), POSTGRES_MAPPING="127.0.0.1:5433",
+    )
+    assert result.returncode != 0
+    assert "publication" in result.stdout + result.stderr
+    assert "rendered-secret" not in result.stdout + result.stderr
+    assert not mutations(operator)
+    states = operator.compose_states()
+    assert len(states) == 1
+    assert states[0]["argv"][-3:] == ["config", "--format", "json"]
+    assert not any("port" in call for call in operator.calls())
+    assert (operator.root / "projects.log").read_text().splitlines() == ["unsafe-fixture"]
+
+
+@pytest.mark.parametrize(
+    "ports",
+    [
+        [],
+        [{"host_ip": "0.0.0.0", "published": "5433", "target": 5432}],
+        [{"host_ip": "127.0.0.1", "published": "15433", "target": 5432}],
+        [{"host_ip": "127.0.0.1", "published": "5433", "target": 5431}],
+        [{"host_ip": "127.0.0.1", "published": "5433", "target": 5432, "protocol": "udp"}],
+        "rendered-secret", ["rendered-secret"], None,
+    ],
+)
+def test_db_exposure_preflight_requires_the_exact_postgres_tcp_publication(operator, ports):
+    config = json.loads(operator.config())
+    config["services"]["postgres"]["ports"] = ports
+    result = operator.run("up", "EXPOSE_DB=1", COMPOSE_CONFIG=json.dumps(config))
+    assert result.returncode != 0
+    assert "publication" in result.stdout + result.stderr
+    assert "127.0.0.1:5433" in result.stdout + result.stderr
+    assert "rendered-secret" not in result.stdout + result.stderr
+    assert not mutations(operator)
+
+
+@pytest.mark.parametrize("raw", ["rendered-secret", "[]", "{}", "null"])
+def test_db_exposure_preflight_rejects_invalid_render_without_disclosure(operator, raw):
+    result = operator.run("up", "EXPOSE_DB=1", COMPOSE_RAW_CONFIG=raw)
+    assert result.returncode != 0
+    assert "publication" in result.stdout + result.stderr
+    assert "rendered-secret" not in result.stdout + result.stderr
+    assert not mutations(operator)
+
+
+def test_db_exposure_preflight_failed_render_hides_stderr_and_prevents_startup(operator):
+    result = operator.run("up", "EXPOSE_DB=1", COMPOSE_FAIL="1", COMPOSE_STDERR="rendered-secret")
+    assert result.returncode != 0
+    assert "preflight" in result.stdout + result.stderr
+    assert "rendered-secret" not in result.stdout + result.stderr
+    assert not mutations(operator)
+
+
+def test_db_exposure_preflight_valid_render_hides_credentials(operator):
+    config = json.loads(operator.config())
+    config["services"]["postgres"]["environment"] = {"POSTGRES_PASSWORD": "rendered-secret"}
+    successful(result := operator.run("up", "EXPOSE_DB=1", COMPOSE_CONFIG=json.dumps(config)))
+    assert "rendered-secret" not in result.stdout + result.stderr
+    assert "PostgreSQL host access verified: 127.0.0.1:5433" in result.stdout
 
 
 def test_maintenance_delegates_to_real_tools(operator):

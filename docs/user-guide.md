@@ -169,7 +169,7 @@ make up EXPOSE_DB=1
 make ready
 ```
 
-The command applies [compose.inspect.yaml](../compose.inspect.yaml) and verifies exactly `127.0.0.1:5433` → container `5432`. Chroma stays unpublished. To force recreation or select another free host port, use:
+The command applies [compose.inspect.yaml](../compose.inspect.yaml), privately checks the complete merged configuration before startup, then verifies the running mapping. The preflight requires exactly one PostgreSQL TCP publication at `127.0.0.1:5433` → container `5432` and no Chroma publications; unsafe custom Compose publications fail before startup. To force recreation or select another free host port, use:
 
 ```sh
 docker compose stop proxy worker

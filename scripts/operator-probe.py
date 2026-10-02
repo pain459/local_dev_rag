@@ -38,6 +38,22 @@ def proxy_port(config):
     return value
 
 
+def database_publications(config, expected_port):
+    services = config["services"]
+    ports = services["postgres"].get("ports", [])
+    if not isinstance(ports, list) or len(ports) != 1:
+        raise ValueError
+    publication = ports[0]
+    if (
+        publication.get("host_ip") != "127.0.0.1"
+        or str(publication.get("published")) != expected_port
+        or publication.get("target") != 5432
+        or publication.get("protocol", "tcp") != "tcp"
+        or services["chromadb"].get("ports")
+    ):
+        raise ValueError
+
+
 def request(port, path):
     # Ignore host proxy env; these checks are exclusively local loopback HTTP.
     opener = build_opener(ProxyHandler({}))
@@ -110,6 +126,9 @@ def main():
         config = json.load(sys.stdin)
         if not isinstance(config, dict):
             raise ValueError
+        if mode == "database-exposure":
+            database_publications(config, sys.argv[2])
+            return 0
         if mode == "opencode":
             return opencode(config, int(sys.argv[2]))
         if mode == "reset":
@@ -191,6 +210,12 @@ def main():
             raise ValueError
         return 0
     except (ValueError, TypeError, KeyError, AttributeError, IndexError, OSError):
+        if mode == "database-exposure":
+            return failure(
+                "Unsafe or invalid database publications: require exactly one PostgreSQL TCP "
+                f"mapping 127.0.0.1:{sys.argv[2]} to 5432 and no Chroma publications. "
+                "Repair the selected Compose files before retrying startup."
+            )
         return failure(
             "Invalid operator config/port. Keep proxy host publication at 127.0.0.1, "
             "target 8080, and PROXY_PORT between 1 and 65535; "

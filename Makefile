@@ -62,6 +62,7 @@ help:
 	  'reset preserves .env, host Ollama models, and Docker images. Back up first.' \
 	  'Database GUI: make up EXPOSE_DB=1 or make recreate EXPOSE_DB=1;' \
 	  '  POSTGRES_INSPECT_PORT=5433 (optional port 1-65535), PostgreSQL on 127.0.0.1 only.' \
+	  '  Preflight rejects extra PostgreSQL mappings or any Chroma host publication.' \
 	  '  Default EXPOSE_DB=0 (or empty) keeps databases private; Chroma stays private.' \
 	  '  Remove host access: make recreate EXPOSE_DB=0 (preserves named volumes).' \
 	  'Overrides: COMPOSE_PROJECT_NAME, COMPOSE_FILE, COMPOSE, DOCKER, UV, PYTHON, NODE, OLLAMA, OPENCODE.' \

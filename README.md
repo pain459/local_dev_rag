@@ -62,7 +62,7 @@ make recreate EXPOSE_DB=1 POSTGRES_INSPECT_PORT=15433
 make ready
 ```
 
-The default verified mapping is `127.0.0.1:5433` to PostgreSQL's internal `5432`; a custom port changes only the host side. Chroma stays private. Disconnect the GUI and pause clients, then run `make recreate` (or `make recreate EXPOSE_DB=0`) with the normal base configuration to remove PostgreSQL host access while preserving named volumes. `make restart` does not remove the port. See the [GUI runbook](docs/operations-guide.md#optional-local-database-gui) for connection fields, writer shutdown, and verification.
+Before startup, the command privately validates the complete merged Compose configuration: exactly one PostgreSQL TCP publication on the selected loopback port and no Chroma publications. Unsafe custom publications fail before startup. The default verified mapping is `127.0.0.1:5433` to PostgreSQL's internal `5432`; a custom port changes only the host side. Disconnect the GUI and pause clients, then run `make recreate` (or `make recreate EXPOSE_DB=0`) with the normal base configuration to remove PostgreSQL host access while preserving named volumes. `make restart` does not remove the port. See the [GUI runbook](docs/operations-guide.md#optional-local-database-gui) for connection fields, writer shutdown, and verification.
 
 ## Safety and limits
 

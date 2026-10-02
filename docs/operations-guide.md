@@ -439,7 +439,7 @@ make up EXPOSE_DB=1
 make ready
 ```
 
-Require `PASS: PostgreSQL host access verified: 127.0.0.1:5433` and full readiness before resuming clients. Startup health alone is insufficient. For forced recreation or a different free host port, use:
+Before starting services, Make captures the effective Compose JSON configuration privately and requires exactly one PostgreSQL TCP publication at the selected `127.0.0.1` host port targeting `5432`, with no Chroma publications. This includes all selected custom files: extra/public PostgreSQL mappings or any Chroma publication fail before startup mutation. Rendered configuration and credentials are not printed. After startup, require `PASS: PostgreSQL host access verified: 127.0.0.1:5433` and full readiness before resuming clients. Startup health alone is insufficient. For forced recreation or a different free host port, use:
 
 ```sh
 docker compose stop proxy worker
@@ -449,14 +449,14 @@ make ready
 
 The verified mapping must now be `127.0.0.1:15433`; use that same port in the GUI. `POSTGRES_INSPECT_PORT` accepts decimal ports from `1` to `65535`. Pass `EXPOSE_DB=1` and the chosen port to each `up`/`recreate` invocation that should retain inspection access. Recreation reuses the existing named volumes; no volume deletion is needed. If startup or mapping verification fails, inspect status and use the removal sequence below.
 
-Low-level equivalent: the Make commands select the base Compose files plus `compose.inspect.yaml`, then run Compose `up` with health waiting (`--build --force-recreate` for `recreate`) and verify `compose port postgres 5432`. To inspect the overlay without applying it under the default configuration:
+At the Compose level, the Make commands select the base files plus `compose.inspect.yaml`, validate the complete merged publication set privately, then run Compose `up` with health waiting (`--build --force-recreate` for `recreate`) and verify `compose port postgres 5432`. To check syntax and the running mapping without applying the overlay under the default configuration:
 
 ```sh
 docker compose -f compose.yaml -f compose.inspect.yaml config --quiet
 docker compose -f compose.yaml -f compose.inspect.yaml port postgres 5432
 ```
 
-The port command reads the running container's mapping; selecting files alone does not enable or remove access. Explicit `-f` flags take precedence over `COMPOSE_FILE`. Preserve custom base files when using low-level commands.
+The port command reads the running container's first matching binding; it does not prove there are no additional publications. The Make preflight establishes the complete configured publication set, while `config --quiet` above only validates syntax. Selecting files alone does not enable or remove access. Explicit `-f` flags take precedence over `COMPOSE_FILE`. Preserve custom base files when using low-level commands.
 
 | GUI connection field | Value |
 | --- | --- |
@@ -488,7 +488,8 @@ Confirm the PostgreSQL status shows no host mapping before resuming clients. `ma
 | Unexpected/empty tables or wrong project | Check `make status`, existing `COMPOSE_PROJECT_NAME`, psql `\conninfo`, `SELECT current_database(), current_user;`, revision and project UUIDs. Do not start a new Compose project or initialize/reset another volume to fix a connection. |
 | Authentication fails after `.env` edits | Existing volumes retain initialized roles/passwords. Use known valid private credentials and check explicit `DATABASE_URL`; follow [credential mismatch](#credential-mismatch). Do not reset volumes or echo passwords. |
 | GUI reaches another local PostgreSQL | Confirm the exact `127.0.0.1` host, chosen port, and `docker compose -f compose.yaml -f compose.inspect.yaml port postgres 5432` mapping. Compare database/revision and internal project UUIDs with container-only psql before inspecting any content. |
-| Mapping verification fails | Treat startup as incomplete; inspect `make status` and the selected Compose files privately. The command requires exactly one loopback mapping. Use `make recreate EXPOSE_DB=0` with the normal base configuration to remove access; do not assume a failed verification removed an already published port. |
+| Publication preflight fails | Startup was not submitted. Repair the selected custom Compose files: retain exactly the selected loopback PostgreSQL TCP mapping and remove all Chroma publications. Existing running containers are unchanged; check `make status` privately before assuming any existing access is closed. |
+| Mapping verification fails | Treat startup as incomplete; inspect `make status` and the selected Compose files privately. Preflight requires exactly one configured loopback mapping; the post-start check verifies its running address. Use `make recreate EXPOSE_DB=0` with the normal base configuration to remove access; do not assume a failed verification removed an already published port. |
 
 ## Backup and restore
 

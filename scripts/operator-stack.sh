@@ -57,6 +57,17 @@ compose_startup() {
         compose "$@"
     fi
 }
+preflight_database_exposure() {
+    [ "${EXPOSE_DB:-}" = 1 ] || return 0
+    # Capture the complete merged publication set: Compose port reports only the
+    # first binding. Keep rendered credentials and render diagnostics private.
+    if ! database_config=$(compose_startup config --format json 2>/dev/null); then
+        fail 'Database publication preflight could not render the selected Compose files; inspect them privately before retrying startup.'
+        return 1
+    fi
+    printf '%s\n' "$database_config" |
+        run_probe "$PYTHON" "$probe" database-exposure "$POSTGRES_INSPECT_PORT"
+}
 verify_database_exposure() {
     [ "${EXPOSE_DB:-}" = 1 ] || return 0
     expected_mapping=127.0.0.1:$POSTGRES_INSPECT_PORT
@@ -73,12 +84,14 @@ verify_database_exposure() {
 case "$1" in
     up)
         startup_timeout; database_exposure
+        preflight_database_exposure
         compose_startup up -d --wait --wait-timeout "$STARTUP_TIMEOUT_SECONDS"
         verify_database_exposure;;
     down) compose down;;
     restart) compose restart;;
     recreate)
         startup_timeout; database_exposure
+        preflight_database_exposure
         compose_startup up --build --force-recreate -d --wait --wait-timeout "$STARTUP_TIMEOUT_SECONDS"
         verify_database_exposure;;
     status) compose ps;;
