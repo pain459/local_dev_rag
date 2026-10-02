@@ -1,7 +1,8 @@
-# Local OpenCode project memory
+# Local Dev RAG
 
 OpenCode keeps its interface, coding tools, permissions, sessions, and model picker. This local OpenAI-compatible proxy adds durable project memory to host Ollama conversations: new sessions can retrieve relevant decisions from earlier sessions in the same project, including after a foreground model change.
 
+- [Product overview](docs/product-overview.md): why Local Dev RAG, who it serves, how project memory works, and how it compares with Claude Code.
 - [User guide](docs/user-guide.md): first-time setup, models, everyday use, saved sessions, and verification.
 - [Operations guide](docs/operations-guide.md): topology, configuration, health, backups, migrations, reindexing, and incident recovery.
 
