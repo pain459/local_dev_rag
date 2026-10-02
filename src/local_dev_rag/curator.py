@@ -441,7 +441,7 @@ class Curator:
         *,
         timeout_seconds: float | None = None,
         max_input_tokens: int = 2048,
-        max_output_tokens: int = 512,
+        max_output_tokens: int = 1024,
         max_response_bytes: int = 32768,
         max_memories: int = 12,
         min_confidence: float = 0.7,
