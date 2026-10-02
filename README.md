@@ -120,11 +120,11 @@ Use OpenCode's `/models` picker to switch among:
 
 | Selectable generation ID | Default context / output limits |
 | --- | --- |
-| `qwen3-coder:30b` (default foreground) | 8192 / 2048 |
-| `qwen2.5-coder:1.5b` | 8192 / 2048 |
-| `qwen2.5-coder:7b` | 8192 / 2048 |
-| `llama3.1:8b` | 8192 / 2048 |
-| `qwen2.5:7b` | 8192 / 2048 |
+| `qwen3-coder:30b` (default foreground) | 65536 / 8192 |
+| `qwen2.5-coder:1.5b` | 32768 / 4096 |
+| `qwen2.5-coder:7b` | 32768 / 4096 |
+| `llama3.1:8b` | 65536 / 8192 |
+| `qwen2.5:7b` | 32768 / 4096 |
 
 For another coding repository, merge the `local-rag` provider and desired default model into that project's `opencode.json`, and copy `rag-memory.js` into that project's `.opencode/plugins/`. Preserve existing provider/plugin configuration. Run `opencode debug config` in that project and check both provider and plugin entries before launching. The databases stay in this Compose project; there is no need for a separate stack per coding repository.
 
@@ -134,7 +134,11 @@ The plugin uses the OpenCode 1.18.30 `chat.headers` hook only for provider `loca
 
 ## Context, extraction, and retrieval limits
 
-`MODEL_BUDGETS` in `.env.example` sets explicit per-model context, output reserve, and a 512-token safety reserve. The initial input target is therefore 5632 estimated tokens. The conservative estimator uses serialized UTF-8 bytes divided by three, rounded up; it is not an exact model tokenizer. Keep OpenCode's `limit.context`/`limit.output` in sync with proxy limits when changing budgets. Inspect your local Ollama metadata (`ollama show MODEL`) and runtime behavior before increasing them; model metadata and actual runtime context allocation can differ.
+The practical policy uses 64K (65536) context for `qwen3-coder:30b` and `llama3.1:8b`, with an 8192-token output reserve and 4096-token safety reserve, leaving 53248 estimated input tokens. The three Qwen2.5 models use 32K (32768) context, a 4096-token output reserve, and a 2048-token safety reserve, leaving 26624 estimated input tokens. These hardware-conscious budgets keep more recent history available and avoid premature compaction; more context does not guarantee factuality or perfect recall.
+
+`MODEL_BUDGETS` in `.env` and `.env.example` supplies the proxy budgets. Keep OpenCode's `limit.context`/`limit.output` in `opencode.json` synchronized with these values and the Python defaults when changing the policy. The conservative estimator uses serialized UTF-8 bytes divided by three, rounded up; it is not an exact model tokenizer.
+
+Ollama must actually allocate at least the selected model's configured context before relying on these limits. Configure the host Ollama runtime context and verify the loaded allocation (`ollama ps`) as well as model metadata (`ollama show MODEL`); advertised model capacity and runtime allocation can differ. These proxy/OpenCode declarations alone do not increase Ollama's runtime context. Larger allocations consume additional memory, so verify them on your hardware before using long requests.
 
 `MEMORY_TOKEN_BUDGET=1024`, `RETRIEVAL_CANDIDATE_LIMIT=20`, `RETRIEVAL_RESULT_LIMIT=6`, and `RETRIEVAL_MIN_SCORE=0.35` bound semantic work and injection. Ranking combines semantic distance, importance, recency, token overlap, and diversity. The default raw semantic floor is 0.2, or exact query-token overlap must support eligibility before ranking bonuses. Only active PostgreSQL-backed memories from the exact project qualify, even if Chroma contains stale records.
 

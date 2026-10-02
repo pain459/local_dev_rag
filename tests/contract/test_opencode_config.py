@@ -1,9 +1,12 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
 import pytest
+from dotenv import dotenv_values
 
+from local_dev_rag.config import Settings
 from local_dev_rag.domain import RequestIdentity
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -14,6 +17,13 @@ MODELS = {
     "llama3.1:8b",
     "qwen2.5:7b",
 }
+EXPECTED_BUDGETS = {
+    "qwen3-coder:30b": {"context_tokens": 65536, "output_tokens": 8192, "safety_tokens": 4096},
+    "qwen2.5-coder:1.5b": {"context_tokens": 32768, "output_tokens": 4096, "safety_tokens": 2048},
+    "qwen2.5-coder:7b": {"context_tokens": 32768, "output_tokens": 4096, "safety_tokens": 2048},
+    "llama3.1:8b": {"context_tokens": 65536, "output_tokens": 8192, "safety_tokens": 4096},
+    "qwen2.5:7b": {"context_tokens": 32768, "output_tokens": 4096, "safety_tokens": 2048},
+}
 
 
 def test_opencode_provider_routes_only_generation_models_to_proxy():
@@ -23,8 +33,34 @@ def test_opencode_provider_routes_only_generation_models_to_proxy():
     assert provider["options"]["baseURL"] == "http://localhost:8080/v1"
     assert set(provider["models"]) == MODELS
     assert config["model"] == "local-rag/qwen3-coder:30b"
-    for model in provider["models"].values():
-        assert model["limit"] == {"context": 8192, "output": 2048}
+    for model_id, model in provider["models"].items():
+        expected = EXPECTED_BUDGETS[model_id]
+        assert model["limit"] == {
+            "context": expected["context_tokens"],
+            "output": expected["output_tokens"],
+        }
+
+
+@pytest.mark.parametrize("env_filename", [".env.example", ".env"])
+def test_deployment_budgets_match_proxy_and_opencode(monkeypatch, env_filename):
+    env_path = ROOT / env_filename
+    if env_filename == ".env" and not env_path.exists():
+        pytest.skip("Local .env is optional; .env.example remains the deployment contract")
+    monkeypatch.delenv("MODEL_BUDGETS", raising=False)
+    for name in os.environ:
+        if name.casefold().startswith("model_budgets__"):
+            monkeypatch.delenv(name)
+    deployment_budgets = json.loads(dotenv_values(env_path)["MODEL_BUDGETS"])
+    defaults = Settings(_env_file=None).model_budgets
+    assert deployment_budgets == EXPECTED_BUDGETS
+    proxy_budgets = {model_id: budget.model_dump() for model_id, budget in defaults.items()}
+    assert proxy_budgets == EXPECTED_BUDGETS
+    models = json.loads((ROOT / "opencode.json").read_text())["provider"]["local-rag"]["models"]
+    for model_id, budget in deployment_budgets.items():
+        assert models[model_id]["limit"] == {
+            "context": budget["context_tokens"],
+            "output": budget["output_tokens"],
+        }
 
 
 def plugin_headers(

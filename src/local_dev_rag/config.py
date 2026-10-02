@@ -9,7 +9,7 @@ from sqlalchemy.engine import URL
 
 
 class ModelBudget(BaseModel):
-    """Conservative token limits until local model metadata is verified."""
+    """Validated context capacity with output and safety reserves."""
 
     context_tokens: int = Field(default=8192, gt=0)
     output_tokens: int = Field(default=2048, gt=0)
@@ -24,14 +24,17 @@ class ModelBudget(BaseModel):
 
 def _default_budgets() -> dict[str, ModelBudget]:
     return {
-        model_id: ModelBudget()
-        for model_id in (
-            "qwen3-coder:30b",
-            "qwen2.5-coder:1.5b",
-            "qwen2.5-coder:7b",
-            "llama3.1:8b",
-            "qwen2.5:7b",
-        )
+        "qwen3-coder:30b": ModelBudget(
+            context_tokens=65536, output_tokens=8192, safety_tokens=4096
+        ),
+        "qwen2.5-coder:1.5b": ModelBudget(
+            context_tokens=32768, output_tokens=4096, safety_tokens=2048
+        ),
+        "qwen2.5-coder:7b": ModelBudget(
+            context_tokens=32768, output_tokens=4096, safety_tokens=2048
+        ),
+        "llama3.1:8b": ModelBudget(context_tokens=65536, output_tokens=8192, safety_tokens=4096),
+        "qwen2.5:7b": ModelBudget(context_tokens=32768, output_tokens=4096, safety_tokens=2048),
     }
 
 

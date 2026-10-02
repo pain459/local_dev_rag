@@ -55,6 +55,28 @@ def test_model_budgets_are_explicit_and_usable():
 
 
 @pytest.mark.parametrize(
+    ("model_id", "context", "output", "safety", "input_target"),
+    [
+        ("qwen3-coder:30b", 65536, 8192, 4096, 53248),
+        ("qwen2.5-coder:1.5b", 32768, 4096, 2048, 26624),
+        ("qwen2.5-coder:7b", 32768, 4096, 2048, 26624),
+        ("llama3.1:8b", 65536, 8192, 4096, 53248),
+        ("qwen2.5:7b", 32768, 4096, 2048, 26624),
+    ],
+)
+def test_model_defaults_reserve_practical_context_headroom(
+    model_id, context, output, safety, input_target
+):
+    budget = Settings(_env_file=None).model_budgets[model_id]
+    assert (budget.context_tokens, budget.output_tokens, budget.safety_tokens) == (
+        context,
+        output,
+        safety,
+    )
+    assert budget.context_tokens - budget.output_tokens - budget.safety_tokens == input_target
+
+
+@pytest.mark.parametrize(
     "values",
     [
         {"proxy_port": 0},
@@ -77,7 +99,7 @@ def test_environment_overrides_budgets_and_service_settings(monkeypatch):
     monkeypatch.setenv("RETRIEVAL_CANDIDATE_LIMIT", "12")
     settings = Settings(_env_file=None)
     assert settings.model_budgets["qwen3-coder:30b"].context_tokens == 16384
-    assert settings.model_budgets["qwen2.5-coder:1.5b"].context_tokens == 8192
+    assert settings.model_budgets["qwen2.5-coder:1.5b"].context_tokens == 32768
     assert len(settings.model_budgets) == 5
     assert settings.proxy_port == 8081
     assert settings.retrieval_candidate_limit == 12
