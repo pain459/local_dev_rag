@@ -288,6 +288,8 @@ Test an existing known memory in a fresh same-project session and unrelated-proj
 
 Chroma normally recovers by reindexing. Optional filesystem snapshots must be cold: stop proxy/worker/Chroma, confirm stopped state, then use your volume-backup tool on only the exact resolved `chroma_data` volume. Verify archive readability; record Chroma image and embedding model/version. Never copy live SQLite/index files or restore over a running server. Prefer rebuilding over uncertain vectors. After restart require ready and scoped recall.
 
+The pinned Chroma 0.6.3 upstream implementation stores `chroma.sqlite3` under `persist_directory` ([SQLite persistence source](https://raw.githubusercontent.com/chroma-core/chroma/0.6.3/chromadb/db/impl/sqlite.py)) and vector index files/metadata in segment subdirectories ([persistent HNSW source](https://raw.githubusercontent.com/chroma-core/chroma/0.6.3/chromadb/segment/impl/vector/local_persistent_hnsw.py)). Compose enables persistence and mounts that directory at `/chroma/chroma`. These version-specific storage references explain why a volume snapshot must cover the entire directory; they do not establish a supported live-backup API or cross-version restore guarantee. The cold-snapshot precautions above are this project's conservative operating policy.
+
 Before restoring `.env`, preserve the current file and compare credentials with initialized PostgreSQL. Old settings may select the wrong database or collection. Verify private permissions and `docker compose config --quiet`, recreate apps, then doctor/ready. Protect all backups with encryption/access controls.
 
 Export important client sessions to new paths:
