@@ -29,9 +29,10 @@ override UV_PYTHON_DOWNLOADS := never
 export UV_PYTHON_DOWNLOADS
 export DOCKER COMPOSE COMPOSE_FILE UV PYTHON NODE OLLAMA OPENCODE LOG_TAIL
 export PROJECT CONFIRM
+export REPO MODEL
 export DIAGNOSTIC_TIMEOUT_SECONDS COMPOSE_TIMEOUT_SECONDS STARTUP_TIMEOUT_SECONDS DOWNLOAD_TIMEOUT_SECONDS
 
-.PHONY: help precheck essentials doctor doctor-fix up down restart recreate status logs ready migrate reindex smoke test check reset
+.PHONY: help precheck essentials doctor doctor-fix up down restart recreate status logs ready migrate reindex smoke test check reset launch
 help:
 	@printf '%s\n' \
 	  'Local RAG operator commands (macOS/Linux)' \
@@ -49,6 +50,7 @@ help:
 	  '  migrate      Upgrade database in running proxy; back up and stop writers first' \
 	  '  reindex      Rebuild one exact project: PROJECT=<exact-id>' \
 	  '  smoke        Live memory smoke (creates isolated smoke records)' \
+	  '  launch       OpenCode for REPO=/path/to/repo (optional MODEL=local-rag/<configured-model>)' \
 	  '  test         Run pytest' \
 	  '  check        Ruff, Pyright, pytest, and Compose render' \
 	  '  reset        Delete current Compose project volumes: exact RESET required' \
@@ -76,6 +78,8 @@ reset:
 	@/bin/sh scripts/reset.sh
 smoke:
 	@/bin/sh scripts/operator-stack.sh smoke
+launch:
+	@/bin/sh scripts/launch-opencode.sh
 test:
 	@"$$UV" run pytest
 check:

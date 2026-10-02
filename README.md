@@ -48,6 +48,7 @@ make doctor
 | `make migrate` | Run `alembic upgrade head` in the running proxy; back up PostgreSQL and stop application writers first |
 | `make reindex PROJECT=<exact-id>` | Rebuild one exact project index; reject empty IDs, whitespace, shell syntax, leading dashes and IDs over 256 characters |
 | `make smoke` / `make test` | Live smoke (creates isolated smoke records) / pytest |
+| `make launch REPO=/path/to/repo` | OpenCode in another coding project using this checkout's provider and memory plugin; optional `MODEL=local-rag/<configured-model>` |
 | `make check` | Ruff, Pyright, pytest, and Compose config validation |
 | `make reset` | Delete only the current Compose project's volumes and remove its orphan containers; exact confirmation required |
 
@@ -126,7 +127,18 @@ Use OpenCode's `/models` picker to switch among:
 | `llama3.1:8b` | 65536 / 8192 |
 | `qwen2.5:7b` | 32768 / 4096 |
 
-For another coding repository, merge the `local-rag` provider and desired default model into that project's `opencode.json`, and copy `rag-memory.js` into that project's `.opencode/plugins/`. Preserve existing provider/plugin configuration. Run `opencode debug config` in that project and check both provider and plugin entries before launching. The databases stay in this Compose project; there is no need for a separate stack per coding repository.
+For another coding repository, run from this checkout after starting the local stack:
+
+```sh
+make launch REPO=/path/to/repo
+make launch REPO="/path/to/coding repo" MODEL=local-rag/qwen2.5-coder:7b
+# A custom executable is one path, including any spaces:
+make launch REPO=/path/to/repo OPENCODE="/path/to/tools directory/opencode"
+```
+
+`REPO` must be an existing directory; relative paths resolve from this checkout. OpenCode receives its absolute path as the project argument, so coding tools and memory identity use the target project. The launcher sets `OPENCODE_CONFIG` to this checkout's absolute `opencode.json` and `OPENCODE_CONFIG_DIR` to its absolute `.opencode` directory, loading the memory plugin without copying it. OpenCode loads project configuration after the custom file; the launcher therefore also replaces `OPENCODE_CONFIG_CONTENT` with inline `local-rag` provider settings and the selected model. These runtime overrides preserve this checkout's provider URL and model budgets even when the target has conflicting settings. Other target settings continue to merge normally. See [OpenCode configuration precedence](https://opencode.ai/docs/config/#precedence-order).
+
+Omitting `MODEL` uses this checkout's `opencode.json` default; an explicit selector must be `local-rag/<configured-model>`. The launcher never sources `.env`, evaluates user input as shell syntax, edits the target repository, or installs host tools. It requires an existing Python runtime to read JSON and an existing OpenCode executable. The interactive process has no deadline and receives terminal signals directly. Normal OpenCode activity may write project files when you authorize coding work. The databases stay in this Compose project; there is no need for a separate stack per coding repository.
 
 The plugin uses the OpenCode 1.18.30 `chat.headers` hook only for provider `local-rag`. It supplies `x-opencode-project-id` and `x-opencode-session-id`, plus a percent-encoded diagnostic root. Project identity hashes OpenCode's project ID with a normalized `origin` remote, falling back to the canonical worktree/directory root. New sessions in the same identity share memory; another identity does not. Changing remote/project identity may create a separate memory namespace. The raw root never overrides the project ID. Direct API clients must supply both identity headers; missing/invalid identity returns HTTP 400. Local callers can choose their own headers, so project filtering is a data-isolation rule, not authentication against a malicious host user.
 
@@ -268,4 +280,4 @@ The smoke defaults to the small installed `qwen2.5-coder:1.5b` foreground model 
 - **Chat works but no older recall:** check `postgres`, `chromadb`, `embedder`, and `memory_jobs`; verify stable project identity, completed jobs and active-memory counts, extraction evidence, relevance thresholds and memory budget. Rebuild after embedding changes. Empty curation is possible by policy.
 - **Worker retry/failed counts rise:** inspect safe error categories and real inference capability. Restore the affected dependency. Completed extraction with zero candidates differs from failed processing; terminal jobs require explicit administrative recovery.
 - **Startup migration/database failure:** check credentials against the initialized volume, PostgreSQL health, installed revision/schema, and app image build. Do not erase volumes to fix a configuration mismatch.
-- **OpenCode provider/plugin missing:** run `opencode debug config` in the coding project; install both project artifacts, check OpenCode 1.18.30 compatibility, and update the base URL after changing the host proxy port.
+- **OpenCode provider/plugin missing:** use `make launch REPO=/path/to/repo` from this checkout, check OpenCode 1.18.30 compatibility, and update this checkout's provider base URL after changing the host proxy port.

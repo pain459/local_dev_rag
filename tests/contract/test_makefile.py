@@ -90,6 +90,14 @@ elif name == "ollama":
         print("NAME ID SIZE MODIFIED")
         for model in json.loads(os.environ["INSTALLED"]): print(model + " abc 1GB now")
 elif name == "opencode":
+    if args and args[0] not in {"--version", "debug", "models"}:
+        pathlib.Path(os.environ["LAUNCH_LOG"]).write_text(json.dumps({
+            "argv": args,
+            "config": os.environ.get("OPENCODE_CONFIG"),
+            "config_dir": os.environ.get("OPENCODE_CONFIG_DIR"),
+            "content": os.environ.get("OPENCODE_CONFIG_CONTENT"),
+        }))
+        sys.exit(int(os.environ.get("OPENCODE_EXIT", "0")))
     if args == ["--version"]: print("1.18.30")
     elif args == ["debug", "config"]:
         config = json.loads(pathlib.Path("opencode.json").read_text())
@@ -149,6 +157,7 @@ def operator(tmp_path):
         "CHILD_PID": str(tmp_path / "child.pid"),
         "PARENT_PID": str(tmp_path / "parent.pid"),
         "UV_POLICY_LOG": str(tmp_path / "uv-policy.txt"),
+        "LAUNCH_LOG": str(tmp_path / "launch.json"),
         "INSTALLED": json.dumps(MODELS),
         "COMPOSE_CONFIG": json.dumps(
             {
@@ -183,6 +192,11 @@ def operator(tmp_path):
         "OLLAMA",
         "OPENCODE",
         "HTTP_MODE",
+        "REPO",
+        "MODEL",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_CONFIG_CONTENT",
     ]:
         env.pop(key, None)
 
@@ -300,6 +314,87 @@ def test_help_discovers_commands_and_safety(operator):
     assert "RESET" in result.stdout and "volumes" in result.stdout
     assert "host tools" in result.stdout
     assert operator.calls() == []
+
+
+@pytest.mark.parametrize("model", [None, "local-rag/qwen2.5-coder:7b"])
+def test_launch_passes_target_and_authoritative_local_config(operator, model):
+    # Catches using the RAG checkout as project, missing inline precedence, or argv splitting.
+    repo = operator.root / "other coding repo"
+    repo.mkdir()
+    target_config = '{"model":"other/model","provider":{"local-rag":{"npm":"wrong"}}}'
+    (repo / "opencode.json").write_text(target_config)
+    (repo / ".env").write_text("$(touch should-not-run)\n")
+    (operator.root / ".env").write_text("$(touch should-not-run)\n")
+    variables = [f"REPO={repo}"]
+    if model:
+        variables.append(f"MODEL={model}")
+    successful(operator.run(
+        "launch", *variables,
+        OPENCODE_CONFIG="wrong", OPENCODE_CONFIG_DIR="wrong",
+        OPENCODE_CONFIG_CONTENT='{"model":"wrong"}',
+    ))
+    launch = json.loads((operator.root / "launch.json").read_text())
+    assert launch["argv"] == [str(repo)] + (["--model", model] if model else [])
+    assert launch["config"] == str(operator.root / "opencode.json")
+    assert launch["config_dir"] == str(operator.root / ".opencode")
+    content = json.loads(launch["content"])
+    assert content["model"] == (model or "local-rag/qwen3-coder:30b")
+    local_config = json.loads((operator.root / "opencode.json").read_text())
+    assert content["provider"] == {"local-rag": local_config["provider"]["local-rag"]}
+    assert content["provider"]["local-rag"]["options"]["baseURL"] == "http://localhost:8080/v1"
+    assert (repo / "opencode.json").read_text() == target_config
+    assert sorted(path.name for path in repo.iterdir()) == [".env", "opencode.json"]
+    assert not (operator.root / "should-not-run").exists()
+    assert operator.calls() == [["opencode", *launch["argv"]]]
+
+
+def test_launch_supports_executable_path_with_spaces_and_relative_repo(operator):
+    repo = operator.root / "target"
+    repo.mkdir()
+    successful(
+        operator.run("launch", "REPO=target", f"OPENCODE={operator.spaced_tool('opencode')}")
+    )
+    assert operator.calls() == [["opencode", str(repo)]]
+
+
+@pytest.mark.parametrize("repo", [None, "", "missing", "opencode.json"])
+def test_launch_rejects_missing_or_invalid_repository_before_execution(operator, repo):
+    variables = [] if repo is None else [f"REPO={repo}"]
+    result = operator.run("launch", *variables)
+    assert result.returncode != 0
+    assert "REPO" in result.stdout + result.stderr
+    assert operator.calls() == []
+
+
+@pytest.mark.parametrize("model", ["other/model", "local-rag/missing", "$(shell touch injected)"])
+def test_launch_rejects_unconfigured_model_without_evaluating_data(operator, model):
+    result = operator.run("launch", f"REPO={operator.root}", f"MODEL={model}")
+    assert result.returncode != 0
+    assert "MODEL" in result.stdout + result.stderr
+    assert operator.calls() == []
+    assert not (operator.root / "injected").exists()
+
+
+def test_launch_preserves_shell_and_make_syntax_in_repository_path(operator):
+    repo = operator.root / "$(shell touch injected); `touch injected`"
+    repo.mkdir()
+    successful(operator.run("launch", f"REPO={repo}"))
+    assert operator.calls() == [["opencode", str(repo)]]
+    assert not (operator.root / "injected").exists()
+
+
+def test_launch_fails_for_missing_opencode_without_installing(operator):
+    operator.remove("opencode")
+    result = operator.run("launch", f"REPO={operator.root}")
+    assert result.returncode != 0
+    assert "OpenCode" in result.stdout + result.stderr
+    assert operator.calls() == []
+
+
+def test_launch_propagates_opencode_failure(operator):
+    result = operator.run("launch", f"REPO={operator.root}", OPENCODE_EXIT="7")
+    assert result.returncode != 0
+    assert operator.calls() == [["opencode", str(operator.root)]]
 
 
 @pytest.mark.parametrize("platform", ["Darwin", "Linux"])
