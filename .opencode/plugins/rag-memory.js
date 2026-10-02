@@ -21,7 +21,7 @@ function normalizeRemote(remote, root) {
 }
 
 /** @type {import("@opencode-ai/plugin").Plugin} */
-export const RagMemoryPlugin = async ({ project, directory, worktree }) => {
+export const RagMemoryPlugin = async ({ project, directory, worktree }, options = {}) => {
   const root = realpathSync(worktree || directory);
   let source = root;
   try {
@@ -34,6 +34,21 @@ export const RagMemoryPlugin = async ({ project, directory, worktree }) => {
   }
   const projectID = createHash("sha256").update(JSON.stringify([project.id, source])).digest("hex");
   return {
+    config: async (config) => {
+      if (!options.launchConfig) return;
+      // OpenCode 1.18.30 runs this after config merging and before constructing
+      // providers. Assignment removes target-only aliases, SDKs, options and limits.
+      const launch = structuredClone(options.launchConfig);
+      config.provider ??= {};
+      config.provider["local-rag"] = launch.provider["local-rag"];
+      config.model = launch.model;
+      if (config.disabled_providers) {
+        config.disabled_providers = config.disabled_providers.filter((id) => id !== "local-rag");
+      }
+      if (config.enabled_providers && !config.enabled_providers.includes("local-rag")) {
+        config.enabled_providers.push("local-rag");
+      }
+    },
     "chat.headers": async (input, output) => {
       const providerID = input.provider?.id ?? input.provider?.info?.id ?? input.model?.providerID;
       if (providerID !== "local-rag") return;

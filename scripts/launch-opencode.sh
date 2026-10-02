@@ -20,11 +20,12 @@ launch_python=$(command -v python3 || command -v python3.12 || command -v "${PYT
 
 OPENCODE_CONFIG=$launch_root/opencode.json
 OPENCODE_CONFIG_DIR=$launch_root/.opencode
-# Project config loads after OPENCODE_CONFIG. Inline config restores our provider
-# and default/selected model after that merge, without editing the coding project.
+# Inline values merge recursively in OpenCode 1.18.30. Pass the same snapshot to
+# the memory plugin's config hook to replace the whole provider after merging.
 OPENCODE_CONFIG_CONTENT=$("$launch_python" - "$OPENCODE_CONFIG" "${MODEL:-}" <<'PY'
 import json
 import sys
+from pathlib import Path
 
 try:
     with open(sys.argv[1], encoding="utf-8") as source:
@@ -33,13 +34,18 @@ try:
     model = sys.argv[2] or config["model"]
     if not model.startswith("local-rag/") or model.removeprefix("local-rag/") not in provider["models"]:
         raise ValueError("MODEL must be local-rag/<configured-model> from this checkout's opencode.json")
-    print(json.dumps({"model": model, "provider": {"local-rag": provider}}))
+    snapshot = {"model": model, "provider": {"local-rag": provider}}
+    plugin = Path(sys.argv[1]).parent / ".opencode/plugins/rag-memory.js"
+    print(json.dumps({**snapshot, "plugin": [[plugin.as_uri(), {"launchConfig": snapshot}]]}))
 except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
     print(f"FAIL: Invalid local OpenCode configuration or MODEL: {error}", file=sys.stderr)
     sys.exit(1)
 PY
 ) || exit 1
 export OPENCODE_CONFIG OPENCODE_CONFIG_DIR OPENCODE_CONFIG_CONTENT
+# This launch requires the memory plugin, including its post-merge config hook.
+OPENCODE_PURE=0
+export OPENCODE_PURE
 
 if [ -n "${MODEL:-}" ]; then
     exec "$OPENCODE" "$launch_repo" --model "$MODEL"
