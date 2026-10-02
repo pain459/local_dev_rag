@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
+import { OpencodeClient } from "@opencode-ai/sdk/v2/client";
 
 // Canonicalize common SSH/HTTPS transports without including credentials.
 function normalizeRemote(remote, root) {
@@ -22,7 +22,7 @@ function normalizeRemote(remote, root) {
 }
 
 /** @type {import("@opencode-ai/plugin").Plugin} */
-export const RagMemoryPlugin = async ({ project, directory, worktree, serverUrl }, options = {}) => {
+export const RagMemoryPlugin = async ({ project, directory, worktree, client }, options = {}) => {
   const root = realpathSync(worktree || directory);
   let source = root;
   try {
@@ -40,7 +40,9 @@ export const RagMemoryPlugin = async ({ project, directory, worktree, serverUrl 
   const pending = new Map();
   const completed = new Map();
   const sessions = new Map();
-  const partsClient = serverUrl ? createOpencodeClient({ baseUrl: String(serverUrl) }) : undefined;
+  // OpenCode 1.18.30 injects v1. Its runtime HeyAPI client carries auth, request
+  // interceptors, and in-process fetch; adapt that transport to the v2 part API.
+  const partsClient = client?._client ? new OpencodeClient({ client: client._client }) : undefined;
   const prune = (entries) => {
     for (const [id, entry] of entries) {
       if (Date.now() - entry.created >= ttl) entries.delete(id);

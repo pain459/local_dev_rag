@@ -17,17 +17,23 @@ def notification_run(tmp_path, scenario):
         let now = 0;
         Date.now = () => now;
         const client = createOpencodeClient({
-            baseUrl: 'http://opencode',
+            baseUrl: scenario.customTransport ? 'http://in-process.invalid' : 'http://opencode',
+            headers: scenario.authenticated ? {authorization:'Bearer test-token'} : {},
             fetch: async (request) => {
                 notices.push({url: request.url, method: request.method,
-                              body: await request.json()});
+                              body: await request.json(), transport:'injected',
+                              headers:Object.fromEntries(request.headers)});
                 if (scenario.promptFailure) throw new Error('unavailable');
                 return Response.json({info: {}, parts: []});
             },
         });
         globalThis.fetch = async (url, options) => {
             if (url instanceof Request && url.method === 'PATCH') {
-                notices.push({url: url.url, method: url.method, body: await url.json()});
+                notices.push({url: url.url, method: url.method, body: await url.json(),
+                              transport:'network',headers:Object.fromEntries(url.headers)});
+                if (scenario.customTransport) throw new Error('no listening server');
+                if (scenario.authenticated) return Response.json({error:'unauthorized'},
+                                                                 {status:401});
                 if (scenario.promptFailure) throw new Error('unavailable');
                 return Response.json({});
             }
@@ -222,6 +228,24 @@ def test_status_part_sorts_after_native_timestamp_parts(tmp_path):
     identifier = result["notices"][0]["body"]["id"]
     # Native ascending part IDs start with a hexadecimal timestamp prefix.
     assert identifier > "prt_ffffffffffffffffffffffffffffffff"
+
+
+def test_part_update_reuses_injected_authentication_headers(tmp_path):
+    result = notification_run(tmp_path, {"authenticated": True})
+    assert len(result["notices"]) == 1
+    notice = result["notices"][0]
+    assert notice["headers"].get("authorization") == "Bearer test-token"
+    assert notice["transport"] == "injected"
+    assert notice["method"] == "PATCH"
+
+
+def test_part_update_uses_in_process_transport_without_a_listening_server(tmp_path):
+    result = notification_run(tmp_path, {"customTransport": True})
+    assert len(result["notices"]) == 1
+    notice = result["notices"][0]
+    assert notice["transport"] == "injected"
+    assert notice["url"].startswith("http://in-process.invalid/session/s-1/message/assistant-1/part/")
+    assert notice["method"] == "PATCH"
 
 
 def test_only_plugin_marked_status_is_removed_before_model_and_capture(tmp_path):
