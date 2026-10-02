@@ -10,11 +10,77 @@ startup_timeout() {
         return 1
     fi
 }
+database_exposure() {
+    case "${EXPOSE_DB:-}" in
+        ''|0|1) ;;
+        *) fail 'EXPOSE_DB must be empty, 0 (private), or 1 (loopback PostgreSQL access).'; return 1;;
+    esac
+    POSTGRES_INSPECT_PORT=${POSTGRES_INSPECT_PORT-5433}
+    case "$POSTGRES_INSPECT_PORT" in
+        ''|*[!0-9]*) fail 'POSTGRES_INSPECT_PORT must be a decimal port between 1 and 65535.'; return 1;;
+    esac
+    # Normalize decimal leading zeroes before comparison and Compose interpolation.
+    # Bound the length before numeric tests so arbitrarily large input cannot overflow.
+    while [ "${POSTGRES_INSPECT_PORT#0}" != "$POSTGRES_INSPECT_PORT" ]; do
+        POSTGRES_INSPECT_PORT=${POSTGRES_INSPECT_PORT#0}
+    done
+    if [ -z "$POSTGRES_INSPECT_PORT" ] || [ "${#POSTGRES_INSPECT_PORT}" -gt 5 ] ||
+        ! [ "$POSTGRES_INSPECT_PORT" -le 65535 ]; then
+        fail 'POSTGRES_INSPECT_PORT must be a decimal port between 1 and 65535.'
+        return 1
+    fi
+    export POSTGRES_INSPECT_PORT
+    inspect_cli_files=0
+    [ "${EXPOSE_DB:-}" = 1 ] || return 0
+    inspect_overlay=$PWD/compose.inspect.yaml
+    # Explicit CLI file flags take precedence over COMPOSE_FILE. Inspect the same
+    # literal words as compose_with_timeout, with glob expansion disabled.
+    if compose_has_file_flags; then
+        inspect_cli_files=1
+    else
+        COMPOSE_FILE=${COMPOSE_FILE:-compose.yaml}${COMPOSE_PATH_SEPARATOR:-:}$inspect_overlay
+        export COMPOSE_FILE
+    fi
+    printf '%s\n' 'To remove PostgreSQL host access: make recreate EXPOSE_DB=0 (preserves named volumes).'
+}
+compose_has_file_flags() (
+    set -f
+    for compose_word in $COMPOSE; do
+        case "$compose_word" in -f|--file|--file=*|-f?*) return 0;; esac
+    done
+    return 1
+)
+compose_startup() {
+    if [ "$inspect_cli_files" = 1 ]; then
+        compose -f "$inspect_overlay" "$@"
+    else
+        compose "$@"
+    fi
+}
+verify_database_exposure() {
+    [ "${EXPOSE_DB:-}" = 1 ] || return 0
+    expected_mapping=127.0.0.1:$POSTGRES_INSPECT_PORT
+    if ! mapping=$(compose_startup port postgres 5432); then
+        fail "Could not verify PostgreSQL mapping; expected $expected_mapping."
+        return 1
+    fi
+    if [ "$mapping" != "$expected_mapping" ]; then
+        fail "Unexpected PostgreSQL mapping; expected only $expected_mapping."
+        return 1
+    fi
+    pass "PostgreSQL host access verified: $expected_mapping"
+}
 case "$1" in
-    up) startup_timeout; compose up -d --wait --wait-timeout "$STARTUP_TIMEOUT_SECONDS";;
+    up)
+        startup_timeout; database_exposure
+        compose_startup up -d --wait --wait-timeout "$STARTUP_TIMEOUT_SECONDS"
+        verify_database_exposure;;
     down) compose down;;
     restart) compose restart;;
-    recreate) startup_timeout; compose up --build --force-recreate -d --wait --wait-timeout "$STARTUP_TIMEOUT_SECONDS";;
+    recreate)
+        startup_timeout; database_exposure
+        compose_startup up --build --force-recreate -d --wait --wait-timeout "$STARTUP_TIMEOUT_SECONDS"
+        verify_database_exposure;;
     status) compose ps;;
     logs) compose_follow logs --tail "${LOG_TAIL:-100}" --follow;;
     smoke) run_deadline "$DOWNLOAD_TIMEOUT_SECONDS" /bin/sh "$operator_dir/smoke.sh";;

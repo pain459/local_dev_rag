@@ -5,6 +5,8 @@ DOCKER ?= docker
 # Empty COMPOSE selects the distinct, quoted DOCKER executable + compose argument.
 COMPOSE ?=
 COMPOSE_FILE ?= compose.yaml
+EXPOSE_DB ?= 0
+POSTGRES_INSPECT_PORT ?= 5433
 UV ?= uv
 PYTHON ?= python3.12
 NODE ?= node
@@ -28,6 +30,7 @@ $(foreach operator_literal_iterator,$(operator_user_variables),$(if $(filter com
 override UV_PYTHON_DOWNLOADS := never
 export UV_PYTHON_DOWNLOADS
 export DOCKER COMPOSE COMPOSE_FILE UV PYTHON NODE OLLAMA OPENCODE LOG_TAIL
+export EXPOSE_DB POSTGRES_INSPECT_PORT
 export PROJECT CONFIRM
 export REPO MODEL
 export DIAGNOSTIC_TIMEOUT_SECONDS COMPOSE_TIMEOUT_SECONDS STARTUP_TIMEOUT_SECONDS DOWNLOAD_TIMEOUT_SECONDS
@@ -57,6 +60,10 @@ help:
 	  'Safety: never installs host tools; never overwrites .env or credentials.' \
 	  'doctor is read-only; doctor-fix downloads/builds without starting services.' \
 	  'reset preserves .env, host Ollama models, and Docker images. Back up first.' \
+	  'Database GUI: make up EXPOSE_DB=1 or make recreate EXPOSE_DB=1;' \
+	  '  POSTGRES_INSPECT_PORT=5433 (optional port 1-65535), PostgreSQL on 127.0.0.1 only.' \
+	  '  Default EXPOSE_DB=0 (or empty) keeps databases private; Chroma stays private.' \
+	  '  Remove host access: make recreate EXPOSE_DB=0 (preserves named volumes).' \
 	  'Overrides: COMPOSE_PROJECT_NAME, COMPOSE_FILE, COMPOSE, DOCKER, UV, PYTHON, NODE, OLLAMA, OPENCODE.' \
 	  'Deadlines (seconds): DIAGNOSTIC_TIMEOUT_SECONDS=15, COMPOSE_TIMEOUT_SECONDS=300,' \
 	  '  STARTUP_TIMEOUT_SECONDS=120, DOWNLOAD_TIMEOUT_SECONDS=3600; logs --follow is unbounded.'

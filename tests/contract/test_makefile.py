@@ -28,6 +28,10 @@ with open(os.environ["TOOL_LOG"], "a") as log:
 if name == "docker" and args and args[0] == "compose":
     with open(os.environ["PROJECT_LOG"], "a") as log:
         log.write(os.environ.get("COMPOSE_PROJECT_NAME", "") + "\n")
+if name in {"docker", "chosen-docker"} and args and args[0] == "compose":
+    with open(os.environ["COMPOSE_STATE_LOG"], "a") as log:
+        log.write(json.dumps({"argv": args, "files": os.environ.get("COMPOSE_FILE", ""),
+            "port": os.environ.get("POSTGRES_INSPECT_PORT", "")}) + "\n")
 if os.environ.get("HANG_CALL") == json.dumps([name, *args]):
     child = subprocess.Popen([sys.executable, "-c",
         "import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); time.sleep(60)"])
@@ -66,7 +70,12 @@ if name == "python3.12":
 elif name == "uname":
     print(os.environ.get("PLATFORM", "Darwin"))
 elif name in {"docker", "chosen-docker"}:
-    if args == ["--version"]: print("Docker version 29.8.1")
+    if "up" in args and os.environ.get("STARTUP_FAIL"):
+        sys.exit(1)
+    elif "port" in args and args[-2:] == ["postgres", "5432"]:
+        if os.environ.get("PORT_FAIL"): sys.exit(1)
+        print(os.environ.get("POSTGRES_MAPPING", "127.0.0.1:5433"))
+    elif args == ["--version"]: print("Docker version 29.8.1")
     elif args == ["info"]: sys.exit(int(os.environ.get("DAEMON_FAIL", "0")))
     elif args[:2] == ["compose", "version"]:
         if os.environ.get("COMPOSE_VERSION_FAIL"): sys.exit(1)
@@ -119,7 +128,9 @@ else:
 
 @pytest.fixture
 def operator(tmp_path):
-    for name in ["Makefile", ".env.example", "compose.yaml", "opencode.json"]:
+    for name in [
+        "Makefile", ".env.example", "compose.yaml", "compose.inspect.yaml", "opencode.json",
+    ]:
         if (ROOT / name).exists():
             shutil.copy(ROOT / name, tmp_path / name)
     shutil.copytree(ROOT / "scripts", tmp_path / "scripts")
@@ -154,6 +165,7 @@ def operator(tmp_path):
         "PATH": str(bin_dir),
         "TOOL_LOG": str(tmp_path / "tools.jsonl"),
         "PROJECT_LOG": str(tmp_path / "projects.log"),
+        "COMPOSE_STATE_LOG": str(tmp_path / "compose-state.jsonl"),
         "CHILD_PID": str(tmp_path / "child.pid"),
         "PARENT_PID": str(tmp_path / "parent.pid"),
         "UV_POLICY_LOG": str(tmp_path / "uv-policy.txt"),
@@ -182,6 +194,9 @@ def operator(tmp_path):
         "COMPOSE_PROJECT_NAME",
         "COMPOSE_FILE",
         "COMPOSE",
+        "COMPOSE_PATH_SEPARATOR",
+        "EXPOSE_DB",
+        "POSTGRES_INSPECT_PORT",
         "DOCKER",
         "PROJECT",
         "CONFIRM",
@@ -220,6 +235,10 @@ def operator(tmp_path):
             return (
                 [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
             )
+
+        def compose_states(self):
+            log = tmp_path / "compose-state.jsonl"
+            return [json.loads(line) for line in log.read_text().splitlines()]
 
         def remove(self, name):
             (bin_dir / name).unlink()
@@ -538,6 +557,175 @@ def test_stack_command_construction_preserves_project(operator, target, args):
     assert ["docker", "compose", *args] in operator.calls()
     assert not any("--volumes" in call for call in operator.calls())
     assert set((operator.root / "projects.log").read_text().splitlines()) == {"operator-fixture"}
+
+
+def test_db_exposure_help_discovers_opt_in_port_and_removal(operator):
+    result = operator.run("help")
+    successful(result)
+    for text in ["EXPOSE_DB=1", "POSTGRES_INSPECT_PORT", "5433", "127.0.0.1", "EXPOSE_DB=0"]:
+        assert text in result.stdout
+    assert "make recreate EXPOSE_DB=0" in result.stdout
+    assert operator.calls() == []
+
+
+@pytest.mark.parametrize("target", ["up", "recreate"])
+@pytest.mark.parametrize("selector", [None, "", "0"])
+def test_db_exposure_default_and_disabled_use_private_base(operator, target, selector):
+    variables = [] if selector is None else ["EXPOSE_DB=" + selector]
+    successful(operator.run(target, *variables, "COMPOSE_FILE=custom base.yaml"))
+    assert len(operator.calls()) == 1
+    assert operator.compose_states()[0]["files"] == "custom base.yaml"
+    assert "-f" not in operator.calls()[0]
+    assert "port" not in operator.calls()[0]
+
+
+@pytest.mark.parametrize("target", ["up", "recreate"])
+@pytest.mark.parametrize(
+    ("port", "expected"), [(None, "5433"), ("15433", "15433"), ("1", "1"),
+                           ("65535", "65535"), ("05433", "5433")],
+)
+def test_db_exposure_starts_with_overlay_and_reports_verified_mapping(
+    operator, target, port, expected,
+):
+    variables = ["EXPOSE_DB=1", "COMPOSE_PROJECT_NAME=exposed-fixture"]
+    if port is not None:
+        variables.append("POSTGRES_INSPECT_PORT=" + port)
+    result = operator.run(target, *variables, POSTGRES_MAPPING="127.0.0.1:" + expected)
+    successful(result)
+    startup = ["docker", "compose", "up"]
+    if target == "recreate":
+        startup += ["--build", "--force-recreate"]
+    startup += ["-d", "--wait", "--wait-timeout", "120"]
+    assert operator.calls() == [startup, ["docker", "compose", "port", "postgres", "5432"]]
+    states = operator.compose_states()
+    assert all(
+        state["files"] == f"compose.yaml:{operator.root}/compose.inspect.yaml" for state in states
+    )
+    assert all(state["port"] == expected for state in states)
+    assert "127.0.0.1:" + expected in result.stdout
+    assert "make recreate EXPOSE_DB=0" in result.stdout
+    assert set((operator.root / "projects.log").read_text().splitlines()) == {"exposed-fixture"}
+    assert not any("--volumes" in call or "chromadb" in call or "config" in call
+                   for call in operator.calls())
+
+
+@pytest.mark.parametrize("target", ["up", "recreate"])
+@pytest.mark.parametrize("selector", ["2", "true", " 1", "1 ", "01", "$(shell touch injected)",
+                                      "1; touch injected", "`touch injected`"])
+def test_db_exposure_rejects_invalid_selector_before_docker(operator, target, selector):
+    # Make strips leading assignment whitespace at parse time; use the environment
+    # for that case to exercise the literal value reaching the operator boundary.
+    if selector.startswith(" "):
+        result = operator.run(target, EXPOSE_DB=selector)
+    else:
+        result = operator.run(target, "EXPOSE_DB=" + selector)
+    assert result.returncode != 0
+    assert "EXPOSE_DB" in result.stdout + result.stderr
+    assert operator.calls() == []
+    assert not (operator.root / "injected").exists()
+
+
+@pytest.mark.parametrize("selector", ["0", "1"])
+@pytest.mark.parametrize("port", ["", "0", "65536", "-1", "+5433", "5.5", "1e3", "5433 ",
+                                  "5433\n", "nine", "9" * 100, "$(shell touch injected)",
+                                  "5433; touch injected", "`touch injected`"])
+def test_db_exposure_rejects_invalid_port_before_docker(operator, selector, port):
+    result = operator.run("up", "EXPOSE_DB=" + selector, "POSTGRES_INSPECT_PORT=" + port)
+    assert result.returncode != 0
+    assert "POSTGRES_INSPECT_PORT" in result.stdout + result.stderr
+    assert operator.calls() == []
+    assert not (operator.root / "injected").exists()
+
+
+@pytest.mark.parametrize("mapping", ["", "0.0.0.0:5433", "[::1]:5433", "127.0.0.1:5434",
+                                     "127.0.0.1:5433\n0.0.0.0:5433", "secret-never-echo"])
+def test_db_exposure_rejects_unexpected_mapping_without_echoing_it(operator, mapping):
+    result = operator.run("up", "EXPOSE_DB=1", POSTGRES_MAPPING=mapping)
+    assert result.returncode != 0
+    assert "mapping" in result.stdout + result.stderr
+    assert "127.0.0.1:5433" in result.stdout + result.stderr
+    assert "secret-never-echo" not in result.stdout + result.stderr
+    assert operator.calls()[-1] == ["docker", "compose", "port", "postgres", "5432"]
+
+
+def test_db_exposure_verification_failure_is_clear(operator):
+    result = operator.run("up", "EXPOSE_DB=1", PORT_FAIL="1")
+    assert result.returncode != 0
+    assert "mapping" in result.stdout + result.stderr
+    assert "make recreate EXPOSE_DB=0" in result.stdout + result.stderr
+
+
+def test_db_exposure_failed_startup_does_not_report_or_probe_success(operator):
+    result = operator.run("up", "EXPOSE_DB=1", STARTUP_FAIL="1")
+    assert result.returncode != 0
+    assert len(operator.calls()) == 1
+    assert "127.0.0.1:5433" not in result.stdout
+
+
+@pytest.mark.parametrize("separator", [":", ";"])
+def test_db_exposure_preserves_custom_compose_files_commands_and_project(operator, separator):
+    files = "custom base.yaml" + separator + "custom override.yaml"
+    result = operator.run(
+        "up", "EXPOSE_DB=1", "COMPOSE=docker compose --ansi never", "COMPOSE_FILE=" + files,
+        "COMPOSE_PATH_SEPARATOR=" + separator, "COMPOSE_PROJECT_NAME=custom-fixture",
+    )
+    successful(result)
+    assert all(state["files"] == files + separator + str(operator.root / "compose.inspect.yaml")
+               for state in operator.compose_states())
+    assert operator.calls()[0][:4] == ["docker", "compose", "--ansi", "never"]
+    assert operator.calls()[-1] == [
+        "docker", "compose", "--ansi", "never", "port", "postgres", "5432",
+    ]
+    assert set((operator.root / "projects.log").read_text().splitlines()) == {"custom-fixture"}
+
+
+@pytest.mark.parametrize("file_args", ["-f custom.yaml", "--file custom.yaml", "--file=custom.yaml",
+                                      "-fcustom.yaml", "-f base.yaml -f override.yaml"])
+def test_db_exposure_preserves_explicit_compose_command_file_flags(operator, file_args):
+    result = operator.run("up", "EXPOSE_DB=1", "COMPOSE=docker compose " + file_args,
+                          "COMPOSE_FILE=ignored-by-cli.yaml")
+    successful(result)
+    prefix = [
+        "docker", "compose", *file_args.split(), "-f", str(operator.root / "compose.inspect.yaml"),
+    ]
+    assert operator.calls() == [
+        [*prefix, "up", "-d", "--wait", "--wait-timeout", "120"],
+        [*prefix, "port", "postgres", "5432"],
+    ]
+    assert all(state["files"] == "ignored-by-cli.yaml" for state in operator.compose_states())
+
+
+def test_db_exposure_preserves_spaced_docker_executable_and_literal_file_names(operator):
+    files = "$(shell touch injected); `touch injected` base.yaml"
+    successful(operator.run("up", "EXPOSE_DB=1", "DOCKER=" + operator.spaced_tool("docker"),
+                            "COMPOSE_FILE=" + files))
+    assert operator.calls()[-1] == ["docker", "compose", "port", "postgres", "5432"]
+    assert operator.compose_states()[0]["files"] == (
+        files + ":" + str(operator.root / "compose.inspect.yaml")
+    )
+    assert not (operator.root / "injected").exists()
+
+
+@pytest.mark.parametrize("target", ["down", "restart", "status", "logs", "migrate", "check"])
+def test_db_exposure_overlay_is_only_applied_to_startup(operator, target):
+    successful(operator.run(target, "EXPOSE_DB=1"))
+    assert all(state["files"] == "compose.yaml" for state in operator.compose_states())
+    assert not any("postgres" in call and "port" in call for call in operator.calls())
+
+
+@pytest.mark.parametrize("operation", ["up", "port"])
+def test_db_exposure_compose_calls_remain_deadline_supervised(operator, operation):
+    call = ["docker", "compose", "up", "-d", "--wait", "--wait-timeout", "17"]
+    if operation == "port":
+        call = ["docker", "compose", "port", "postgres", "5432"]
+    try:
+        result = operator.run("up", "EXPOSE_DB=1", "STARTUP_TIMEOUT_SECONDS=17",
+                              "COMPOSE_TIMEOUT_SECONDS=1", HANG_CALL=json.dumps(call),
+                              test_timeout=4)
+        assert result.returncode != 0
+        operator.assert_child_stopped()
+    finally:
+        operator.cleanup_fake_processes()
 
 
 def test_maintenance_delegates_to_real_tools(operator):
