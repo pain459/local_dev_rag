@@ -366,6 +366,24 @@ def test_launch_rejects_missing_or_invalid_repository_before_execution(operator,
     assert operator.calls() == []
 
 
+def test_launch_rejects_unreadable_but_traversable_repository(operator):
+    # Catches treating successful directory traversal as proof of readability.
+    repo = operator.root / "execute only repo"
+    repo.mkdir()
+    repo.chmod(0o100)
+    try:
+        if os.access(repo, os.R_OK):
+            pytest.skip("Current user can read execute-only directories")
+        assert os.access(repo, os.X_OK)
+        result = operator.run("launch", f"REPO={repo}")
+        assert result.returncode != 0
+        assert "REPO" in result.stdout + result.stderr
+        assert "readable" in result.stdout + result.stderr
+        assert operator.calls() == []
+    finally:
+        repo.chmod(0o700)
+
+
 @pytest.mark.parametrize("model", ["other/model", "local-rag/missing", "$(shell touch injected)"])
 def test_launch_rejects_unconfigured_model_without_evaluating_data(operator, model):
     result = operator.run("launch", f"REPO={operator.root}", f"MODEL={model}")

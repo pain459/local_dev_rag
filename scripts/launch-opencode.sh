@@ -6,6 +6,7 @@ fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
 
 [ -n "${REPO:-}" ] || fail 'REPO is required: make launch REPO=/path/to/repo'
 [ -d "$REPO" ] || fail 'REPO must name an existing directory.'
+[ -r "$REPO" ] || fail 'REPO must name a readable directory.'
 case "$REPO" in
     /*) launch_repo=$REPO ;;
     *) launch_repo=$PWD/$REPO ;;
