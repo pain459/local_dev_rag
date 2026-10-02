@@ -23,6 +23,40 @@ Ollama must listen on an address reachable from containers. On macOS, Docker Des
 
 ## First launch
 
+The Makefile provides the same operator workflow with prerequisite checks:
+
+```sh
+make help
+make precheck
+# Start host Ollama (ollama serve) before model downloads.
+make essentials                 # Creates .env only if absent; syncs/downloads/builds
+# Review .env before starting the stack.
+make up
+make doctor
+```
+
+| Command | Behavior |
+| --- | --- |
+| `make help` / `make precheck` | Discover commands / read-only host tools, versions, Docker daemon, ports and config checks |
+| `make essentials` | Preserve existing `.env`, sync all Python dependency groups, pull/build Compose assets, pull five generation models plus configured curator/embedder |
+| `make doctor` | Read-only tool/config/model/plugin, service, liveness/readiness, migration and worker diagnosis with remedies |
+| `make doctor-fix` | Create missing `.env`, sync Python dependencies, pull missing images/models, build images, then rerun doctor; never starts the stack |
+| `make up` / `make down` | Start and wait for Compose health / stop while preserving volumes |
+| `make restart` / `make recreate` | Restart / build and force recreate with a health wait |
+| `make status` / `make logs` | Service state / follow logs (`LOG_TAIL=100`) |
+| `make ready` | Require `/healthz` and full six-dependency readiness; Compose health alone is insufficient |
+| `make migrate` | Run `alembic upgrade head` in the running proxy; back up PostgreSQL and stop application writers first |
+| `make reindex PROJECT=<exact-id>` | Rebuild one exact project index; reject empty IDs, whitespace, shell syntax, leading dashes and IDs over 256 characters |
+| `make smoke` / `make test` | Live smoke (creates isolated smoke records) / pytest |
+| `make check` | Ruff, Pyright, pytest, and Compose config validation |
+| `make reset` | Delete only the current Compose project's volumes and remove its orphan containers; exact confirmation required |
+
+`doctor` only diagnoses; it never repairs or runs model inference. `doctor-fix` performs explicit project-local/download remediation and may still fail its final diagnosis if services are stopped or host configuration needs attention. Neither command installs host tools, changes credentials, or resets data. Missing tools receive macOS/Linux installation recommendations. Python 3.12 is required; other tool versions are shown alongside the verified versions documented above, without claiming compatibility for unverified versions.
+
+All targets honor `COMPOSE_PROJECT_NAME` and `COMPOSE_FILE`. Tool command overrides include `DOCKER`, `COMPOSE` (a command plus whitespace-separated arguments, without shell evaluation), `UV`, `PYTHON`, `NODE`, `OLLAMA`, and `OPENCODE`. Host model operations honor Ollama's standard `OLLAMA_HOST`; `.env`'s `OLLAMA_URL` configures container access. Keep them pointed at the same Ollama server. Keep the local `opencode.json` provider port aligned with the rendered Compose port.
+
+`reset` prints the resolved Compose project and exact configured volume names before proceeding. Back up durable memory first. At a terminal, type exactly `RESET`; for intentional automation, use `make reset CONFIRM=RESET`. Without a TTY or exact confirmation it refuses. It runs only `docker compose down --volumes --remove-orphans`, preserving `.env`, host Ollama models and Docker images; it never runs Docker prune. Use a stable Compose project name to avoid accidentally selecting a different memory stack.
+
 On the host, start Ollama (`ollama serve` if your installed service is not already running), then install the five generation models and hidden embedder:
 
 ```sh

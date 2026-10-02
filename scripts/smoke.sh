@@ -5,11 +5,15 @@ script_dir=${0%/*}
 CDPATH= cd "$script_dir/.."
 
 fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
-command -v docker >/dev/null 2>&1 || fail "Install Docker with the Compose plugin, then rerun ./scripts/smoke.sh."
-docker info >/dev/null 2>&1 || fail "Start Docker Desktop or the Docker daemon; verify docker info."
-docker compose version >/dev/null 2>&1 || fail "Install Docker Compose v2+; verify docker compose version."
-docker compose config --quiet >/dev/null 2>&1 || fail "Fix .env/compose.yaml; run docker compose config --quiet."
-running=$(docker compose ps --status running --services 2>/dev/null) || fail "Inspect docker compose ps; run docker compose up --build -d --wait."
+docker_cli=${DOCKER:-docker}
+compose_command=${COMPOSE:-"$docker_cli compose"}
+# Match the Makefile operator command overrides, without evaluating shell syntax.
+smoke_compose() { (set -f; $compose_command "$@"); }
+command -v "$docker_cli" >/dev/null 2>&1 || fail "Install Docker with the Compose plugin, then rerun ./scripts/smoke.sh."
+"$docker_cli" info >/dev/null 2>&1 || fail "Start Docker Desktop or the Docker daemon; verify docker info."
+smoke_compose version >/dev/null 2>&1 || fail "Install Docker Compose v2+; verify docker compose version."
+smoke_compose config --quiet >/dev/null 2>&1 || fail "Fix .env/compose.yaml; run docker compose config --quiet."
+running=$(smoke_compose ps --status running --services 2>/dev/null) || fail "Inspect docker compose ps; run docker compose up --build -d --wait."
 for service in proxy worker postgres chromadb; do
     case "
 $running
@@ -17,11 +21,11 @@ $running
 $service
 "*) ;; *) fail "$service is not running. Run docker compose up --build -d --wait; inspect docker compose logs $service.";; esac
 done
-published=$(docker compose port proxy 8080 2>/dev/null) || fail "Publish proxy port 8080 on host loopback in compose.yaml."
+published=$(smoke_compose port proxy 8080 2>/dev/null) || fail "Publish proxy port 8080 on host loopback in compose.yaml."
 case "$published" in 127.0.0.1:*) ;; *) fail "Bind the published proxy only to 127.0.0.1 in compose.yaml.";; esac
 printf 'PASS: Docker, four services, loopback proxy publication\n'
 
-docker compose exec -T \
+smoke_compose exec -T \
     -e SMOKE_MODEL="${SMOKE_MODEL:-qwen2.5-coder:1.5b}" \
     -e SMOKE_TIMEOUT_SECONDS="${SMOKE_TIMEOUT_SECONDS:-300}" \
     proxy python - <<'PY'
