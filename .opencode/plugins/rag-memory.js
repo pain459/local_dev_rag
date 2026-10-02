@@ -35,7 +35,8 @@ export const RagMemoryPlugin = async ({ project, directory, worktree }) => {
   const projectID = createHash("sha256").update(JSON.stringify([project.id, source])).digest("hex");
   return {
     "chat.headers": async (input, output) => {
-      if (input.provider.info.id !== "local-rag") return;
+      const providerID = input.provider?.id ?? input.provider?.info?.id ?? input.model?.providerID;
+      if (providerID !== "local-rag") return;
       output.headers["x-opencode-session-id"] = input.sessionID;
       output.headers["x-opencode-project-id"] = projectID;
       // Fetch headers require HTTP-safe bytes, including for Unicode project paths.

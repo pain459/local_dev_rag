@@ -27,16 +27,59 @@ def test_opencode_provider_routes_only_generation_models_to_proxy():
         assert model["limit"] == {"context": 8192, "output": 2048}
 
 
-def plugin_headers(directory, provider="local-rag", project_id="repo-identity", session="s-1"):
+def plugin_headers(
+    directory,
+    provider="local-rag",
+    project_id="repo-identity",
+    session="s-1",
+    *,
+    provider_shape="flat",
+    model_provider=None,
+):
+    model_provider = provider if model_provider is None else model_provider
+    provider_info = {
+        "id": provider,
+        "name": provider,
+        "source": "config",
+        "env": [],
+        "options": {},
+        "models": {},
+    }
+    hook_input = {
+        "sessionID": session,
+        "agent": "build",
+        "model": {"id": "qwen3-coder:30b"},
+        "message": {
+            "id": "message-1",
+            "sessionID": session,
+            "role": "user",
+            "time": {"created": 0},
+            "agent": "build",
+            "model": {"modelID": "qwen3-coder:30b"},
+        },
+    }
+    if model_provider is not None:
+        hook_input["model"]["providerID"] = model_provider
+        hook_input["message"]["model"]["providerID"] = model_provider
+    if provider_shape == "flat":
+        hook_input["provider"] = provider_info
+    elif provider_shape == "nested":
+        hook_input["provider"] = {
+            "source": "config",
+            "info": provider_info,
+            "options": {},
+        }
+    elif provider_shape != "missing":
+        raise ValueError(f"Unsupported provider shape: {provider_shape}")
+
     script = """
         const { RagMemoryPlugin } = await import(process.argv[1]);
         const hooks = await RagMemoryPlugin({
-            project: { id: process.argv[4] }, directory: process.argv[2],
+            project: { id: process.argv[3] }, directory: process.argv[2],
             worktree: process.argv[2],
         });
         const output = { headers: { existing: 'kept' } };
-        await hooks['chat.headers']({ sessionID: process.argv[5],
-            provider: { info: { id: process.argv[3] } } }, output);
+        await hooks['chat.headers'](JSON.parse(process.argv[4]), output);
         const request = new Request('http://localhost:8080/v1/chat/completions', {
             method: 'POST', headers: output.headers,
         });
@@ -50,9 +93,8 @@ def plugin_headers(directory, provider="local-rag", project_id="repo-identity", 
             script,
             (ROOT / ".opencode/plugins/rag-memory.js").as_uri(),
             str(directory),
-            provider,
             project_id,
-            session,
+            json.dumps(hook_input),
         ],
         check=False,
         capture_output=True,
@@ -83,8 +125,27 @@ def test_plugin_adds_identity_and_preserves_existing_headers(tmp_path):
     )
 
 
+def test_plugin_supports_published_nested_provider_context(tmp_path):
+    headers = plugin_headers(tmp_path, provider_shape="nested")
+    assert headers["x-opencode-session-id"] == "s-1"
+
+
 def test_plugin_leaves_other_providers_untouched(tmp_path):
     assert plugin_headers(tmp_path, provider="other") == {"existing": "kept"}
+
+
+def test_plugin_uses_model_provider_when_provider_metadata_is_missing(tmp_path):
+    headers = plugin_headers(
+        tmp_path,
+        provider=None,
+        provider_shape="missing",
+        model_provider="local-rag",
+    )
+    assert headers["x-opencode-session-id"] == "s-1"
+
+
+def test_plugin_leaves_unknown_provider_metadata_untouched(tmp_path):
+    assert plugin_headers(tmp_path, provider=None, provider_shape="missing") == {"existing": "kept"}
 
 
 @pytest.mark.parametrize("name", ["项目", "percent%2F space\nfolder"])

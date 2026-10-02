@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.mark.parametrize("explicit_url", [False, True])
-def test_compose_special_character_password_reaches_both_apps_intact(explicit_url):
+def test_compose_special_character_password_reaches_both_apps_intact(explicit_url, monkeypatch):
     from sqlalchemy.engine import make_url
 
     from local_dev_rag.config import Settings
@@ -37,14 +37,48 @@ def test_compose_special_character_password_reaches_both_apps_intact(explicit_ur
     )
     assert config["services"]["postgres"]["environment"]["POSTGRES_PASSWORD"] == password
     for name in ("proxy", "worker"):
-        values = {
-            key.lower(): value for key, value in config["services"][name]["environment"].items()
+        container_environment = {
+            key: str(value) for key, value in config["services"][name]["environment"].items()
         }
-        settings = Settings(**values, _env_file=None)
+        container_environment.setdefault(
+            "MODEL_BUDGETS",
+            json.dumps(
+                {
+                    "contract-model": {
+                        "context_tokens": 4096,
+                        "output_tokens": 512,
+                        "safety_tokens": 128,
+                    }
+                }
+            ),
+        )
+        container_environment.setdefault(
+            "RANKING_WEIGHTS",
+            json.dumps(
+                {
+                    "semantic": 0.8,
+                    "importance": 0.2,
+                    "recency": 0,
+                    "overlap": 0,
+                    "diversity": 0,
+                    "recency_half_life_days": 30,
+                    "min_semantic_similarity": 0.2,
+                }
+            ),
+        )
+        with monkeypatch.context() as environment:
+            environment.setattr(os, "environ", container_environment)
+            settings = Settings(_env_file=None)
         url = make_url(settings.database_url)
         assert url.password == password
         assert url.host == "postgres" and url.username == "local_rag"
         assert url.database == "local_rag"
+        rendered_budgets = json.loads(container_environment["MODEL_BUDGETS"])
+        for model_id, budget in rendered_budgets.items():
+            assert settings.model_budgets[model_id].model_dump() == budget
+        assert settings.ranking_weights.model_dump() == json.loads(
+            container_environment["RANKING_WEIGHTS"]
+        )
 
 
 def test_worker_healthcheck_is_bounded_and_does_not_start_the_job_loop():
