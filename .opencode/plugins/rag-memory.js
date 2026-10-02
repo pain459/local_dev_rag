@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import { createOpencodeClient } from "@opencode-ai/sdk/v2/client";
 
 // Canonicalize common SSH/HTTPS transports without including credentials.
 function normalizeRemote(remote, root) {
@@ -21,7 +22,7 @@ function normalizeRemote(remote, root) {
 }
 
 /** @type {import("@opencode-ai/plugin").Plugin} */
-export const RagMemoryPlugin = async ({ project, directory, worktree, client }, options = {}) => {
+export const RagMemoryPlugin = async ({ project, directory, worktree, serverUrl }, options = {}) => {
   const root = realpathSync(worktree || directory);
   let source = root;
   try {
@@ -33,16 +34,37 @@ export const RagMemoryPlugin = async ({ project, directory, worktree, client }, 
     // Non-Git projects and repositories without origin use the canonical root.
   }
   const projectID = createHash("sha256").update(JSON.stringify([project.id, source])).digest("hex");
-  // Both maps expire after five minutes and hold at most 512 entries per plugin.
+  // Lifecycle and observation maps expire after five minutes, capped at 512 entries.
   const ttl = 300_000;
   const limit = 512;
   const pending = new Map();
   const completed = new Map();
+  const sessions = new Map();
+  const partsClient = serverUrl ? createOpencodeClient({ baseUrl: String(serverUrl) }) : undefined;
   const prune = (entries) => {
     for (const [id, entry] of entries) {
       if (Date.now() - entry.created >= ttl) entries.delete(id);
     }
     while (entries.size > limit) entries.delete(entries.keys().next().value);
+  };
+  const session = (sessionID) => {
+    prune(sessions);
+    if (!sessions.has(sessionID)) {
+      sessions.set(sessionID, { epoch: 0, idle: false, created: Date.now() });
+      prune(sessions);
+    }
+    return sessions.get(sessionID);
+  };
+  const busy = (sessionID, parentID) => {
+    const state = session(sessionID);
+    state.epoch++;
+    state.idle = false;
+    state.created = Date.now();
+    if (parentID !== undefined && state.parentID !== parentID) {
+      state.parentID = parentID;
+      state.candidate = undefined;
+    }
+    return state;
   };
   return {
     config: async (config) => {
@@ -61,6 +83,7 @@ export const RagMemoryPlugin = async ({ project, directory, worktree, client }, 
       }
     },
     "chat.headers": async (input, output) => {
+      busy(input.sessionID, input.message?.id);
       const providerID = input.provider?.id ?? input.provider?.info?.id ?? input.model?.providerID;
       if (providerID !== "local-rag") return;
       output.headers["x-opencode-session-id"] = input.sessionID;
@@ -79,10 +102,38 @@ export const RagMemoryPlugin = async ({ project, directory, worktree, client }, 
       prune(pending);
     },
     event: async ({ event }) => {
-      if (event.type !== "message.updated") return;
-      const info = event.properties.info;
-      if (info.role !== "assistant" || info.providerID !== "local-rag"
-        || info.time?.completed === undefined || info.error || info.summary) return;
+      if (event.type === "session.deleted") {
+        sessions.delete(event.properties.info.id);
+        return;
+      }
+      if (event.type === "session.status" && event.properties.status.type !== "idle") {
+        busy(event.properties.sessionID);
+        return;
+      }
+      if (event.type === "message.updated") {
+        const info = event.properties.info;
+        if (info.role === "user") {
+          busy(info.sessionID, info.id);
+          return;
+        }
+        const state = session(info.sessionID);
+        if (info.error || info.summary || info.providerID !== "local-rag") {
+          state.candidate = undefined;
+        } else if (info.time?.completed !== undefined && info.parentID === state.parentID) {
+          // Tool-step completions only select a target. No writes happen until idle.
+          state.candidate = info;
+        }
+        return;
+      }
+      const idleEvent = event.type === "session.idle"
+        || (event.type === "session.status" && event.properties.status.type === "idle");
+      if (!idleEvent) return;
+      const sessionID = event.properties.sessionID;
+      const state = session(sessionID);
+      state.idle = true;
+      const info = state.candidate;
+      if (!info || !partsClient) return;
+      const epoch = state.epoch;
       prune(pending);
       prune(completed);
       const key = `${info.sessionID}:${info.id}`;
@@ -117,21 +168,29 @@ export const RagMemoryPlugin = async ({ project, directory, worktree, client }, 
         }));
         const tokens = counts.reduce((total, count) => total + count, 0);
         if (!Number.isSafeInteger(tokens) || tokens <= 0) return;
-        await client.session.prompt({
-          path: { id: info.sessionID }, query: { directory: root },
-          body: {
-            noReply: true,
-            parts: [{
-              type: "text", text: `🧠 RAG memory applied · ${tokens} context tokens`,
-              // OpenCode 1.18.30 hides synthetic text in its user-message renderer.
-              // ignored excludes this programmatic status from model conversion;
-              // noReply above keeps its append from starting a provider request.
-              ignored: true,
-            }],
+        // A new user turn/busy event during lookup invalidates this observation.
+        if (sessions.get(sessionID) !== state || !state.idle || state.epoch !== epoch) return;
+        // Native part IDs begin with hex timestamps; z sorts this status last.
+        const partID = `prt_z${randomUUID().replaceAll("-", "")}`;
+        await partsClient.part.update({
+          sessionID, messageID: info.id, partID, directory: root,
+          part: {
+            id: partID, sessionID, messageID: info.id,
+            type: "text", text: `🧠 RAG memory applied · ${tokens} context tokens`,
+            synthetic: true, ignored: true, metadata: { localDevRagNotice: true },
           },
         });
       } catch {
         // Status diagnostics and notice failures never interrupt coding.
+      }
+    },
+    "experimental.chat.messages.transform": async (_input, output) => {
+      // OpenCode 1.18.30 ignores the ignored flag only on user parts. Strip our
+      // marked assistant status before model conversion, hence before proxy capture.
+      for (const message of output.messages) {
+        message.parts = message.parts.filter((part) => !(part.type === "text"
+          && part.synthetic === true && part.ignored === true
+          && part.metadata?.localDevRagNotice === true));
       }
     },
   };
